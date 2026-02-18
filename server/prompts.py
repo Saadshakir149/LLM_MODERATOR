@@ -11,10 +11,6 @@ import random
 import traceback
 from dotenv import load_dotenv
 
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, SystemMessage
-from chatbot import Chatbot
-
 # ============================================================
 # 🔧 Environment Setup
 # ============================================================
@@ -22,7 +18,7 @@ load_dotenv()
 logger = logging.getLogger("moderator-prompts")
 
 # ============================================================
-# ⚙️ Config Loader (Single Source of Truth)
+# ⚙️ Config Loader
 # ============================================================
 def get_env(name: str, cast=str, required: bool = False):
     value = os.getenv(name)
@@ -41,46 +37,51 @@ def get_env(name: str, cast=str, required: bool = False):
 # ============================================================
 # 🌍 Core Model Configuration
 # ============================================================
-OPENAI_MODEL = get_env("OPENAI_CHAT_MODEL", str, True)
-TEMPERATURE = get_env("OPENAI_TEMPERATURE", float, True)
-MAX_TOKENS = get_env("OPENAI_MAX_TOKENS", int, True)
+LLM_PROVIDER = get_env("LLM_PROVIDER", str, False) or "groq"
+GROQ_MODEL = get_env("GROQ_MODEL", str, False) or "llama-3.1-8b-instant"
+GROQ_TEMPERATURE = get_env("GROQ_TEMPERATURE", float, False) or 0.7
+GROQ_MAX_TOKENS = get_env("GROQ_MAX_TOKENS", int, False) or 2000
 
-ACTIVE_MODE = get_env("ACTIVE_MODE", str, True).lower().strip()
-PASSIVE_MODE = get_env("PASSIVE_MODE", str, True).lower().strip()
+OPENAI_MODEL = get_env("OPENAI_CHAT_MODEL", str, False) or "gpt-3.5-turbo"
+OPENAI_TEMPERATURE = get_env("OPENAI_TEMPERATURE", float, False) or 0.7
+OPENAI_MAX_TOKENS = get_env("OPENAI_MAX_TOKENS", int, False) or 1000
 
-ACTIVE_STORY_STEP = get_env("ACTIVE_STORY_STEP", int, True)
-PASSIVE_STORY_STEP = get_env("PASSIVE_STORY_STEP", int, True)
+ACTIVE_STORY_STEP = get_env("ACTIVE_STORY_STEP", int, False) or 1
+PASSIVE_STORY_STEP = get_env("PASSIVE_STORY_STEP", int, False) or 1
+CHAT_HISTORY_LIMIT = get_env("CHAT_HISTORY_LIMIT", int, False) or 50
 
-CHAT_HISTORY_LIMIT = get_env("CHAT_HISTORY_LIMIT", int, True)
-
-ACTIVE_ENDING_STYLE = get_env("ACTIVE_ENDING_STYLE", str, True).lower().strip()
-PASSIVE_ENDING_STYLE = get_env("PASSIVE_ENDING_STYLE", str, True).lower().strip()
-
-WELCOME_MESSAGE = get_env("WELCOME_MESSAGE", str, True)
-ACTIVE_ENDING_MESSAGE = get_env("ACTIVE_ENDING_MESSAGE", str, True)
-PASSIVE_ENDING_MESSAGE = get_env("PASSIVE_ENDING_MESSAGE", str, True)
+WELCOME_MESSAGE = get_env("WELCOME_MESSAGE", str, False) or "Welcome everyone! I'm the Moderator."
+ACTIVE_ENDING_MESSAGE = get_env("ACTIVE_ENDING_MESSAGE", str, False) or "✨ We have reached the end of the story."
+PASSIVE_ENDING_MESSAGE = get_env("PASSIVE_ENDING_MESSAGE", str, False) or "✨ We have reached the end of the story."
 
 # ============================================================
-# 🧠 LLM Initialization
+# 🧠 Groq Client Initialization
 # ============================================================
-llm = ChatOpenAI(
-    model=OPENAI_MODEL,
-    temperature=TEMPERATURE,
-    max_tokens=MAX_TOKENS,
-)
+groq_client = None
+openai_client = None
 
-fallback_chatbot = Chatbot(
-    system_prompt=(
-        "You are a warm, emotionally intelligent classroom moderator "
-        "who guides students gently and keeps them engaged."
-    )
-)
+try:
+    if LLM_PROVIDER == "groq":
+        from groq import Groq
+        api_key = os.getenv("GROQ_API_KEY")
+        if api_key and api_key.strip():
+            groq_client = Groq(api_key=api_key)
+            logger.info(f"✅ Groq client initialized with {GROQ_MODEL}")
+        else:
+            logger.error("❌ GROQ_API_KEY not found")
+    elif LLM_PROVIDER == "openai":
+        from openai import OpenAI
+        api_key = os.getenv("OPENAI_API_KEY")
+        if api_key and api_key.strip():
+            openai_client = OpenAI(api_key=api_key)
+            logger.info("✅ OpenAI client initialized")
+except Exception as e:
+    logger.error(f"❌ LLM client initialization failed: {e}")
 
 # ============================================================
-# 🧩 ACTIVE MODE PROMPTS — ENHANCED (NO DELETIONS)
+# 🧩 ACTIVE MODE PROMPTS
 # ============================================================
 ACTIVE_MODE_PROMPTS = {
-
     "story": """
 You are a warm, supportive classroom Moderator guiding students through a FIXED, pre-written story.
 
@@ -100,92 +101,68 @@ How you treat students:
 - You validate feelings, curiosity, and effort.
 - You never shame, criticize, or dismiss students.
 
-Story control (very important):
+Story control:
 - The story is the authority; student input is secondary.
 - You NEVER change the plot based on student ideas.
 - If a student idea conflicts with the story, you kindly redirect.
-- If a student is silly, wrong, off-topic, or inappropriate, you respond calmly and continue the story.
 
 How to respond:
 - 1–2 short sentences only.
 - First: a gentle acknowledgment or encouragement.
 - Then: continue the NEXT sentence(s) of the story as written.
 - Each response advances the story by ONE step only.
-
-Behavior rules:
-- You are a guide, not a co-author.
-- You never stall, loop, or drift away from the story.
-- You speak once per interval, then pause.
-
-Ending:
-- When the final story sentence is reached, you deliver the ending gently.
-- After the ending, you stop completely.
-
-
-""",
-
-    "discussion": """
-You are the Moderator guiding a structured discussion.
-
-Tone:
-- Calm, respectful, encouraging
-
-Rules:
-- Short responses
-- Summarize key ideas gently
-- Encourage quieter students by name when appropriate
-- Keep momentum without pressure
-""",
-
-    "teacher": """
-You are a supportive teacher-moderator.
-
-Tone:
-- Patient, kind, reassuring
-
-Rules:
-- Explain simply
-- Encourage curiosity
-- Correct gently through examples
-- Always move forward positively
 """
 }
 
 # ============================================================
-# 🧭 Tone Adaptation (Optional Context Layer)
+# 🛠 Helper Functions
 # ============================================================
-def generate_style_hint(majors: List[str]) -> str:
-    joined = ", ".join(majors).lower()
-    if any(x in joined for x in ["computer", "engineering", "data", "math"]):
-        return "Logical but friendly tone."
-    if any(x in joined for x in ["education", "psychology", "social"]):
-        return "Warm, empathetic tone."
-    if any(x in joined for x in ["art", "design", "media"]):
-        return "Imaginative, expressive tone."
-    return "Balanced, friendly classroom tone."
-
-# ============================================================
-# 🧠 INTERNAL ANALYSIS PROMPT (Hidden Layer — unchanged)
-# ============================================================
-def _internal_story_analysis(chat_history, story_block):
+def call_llm(messages, temperature=None, max_tokens=None, system_prompt=None):
+    """Make LLM API call (Groq or OpenAI fallback)"""
+    if not groq_client and not openai_client:
+        logger.error("No LLM client available")
+        return None
+    
     try:
-        prompt = f"""
-Analyze the classroom interaction silently.
-Do NOT generate output for students.
+        if groq_client:
+            groq_messages = []
+            if system_prompt:
+                groq_messages.append({"role": "system", "content": system_prompt})
+            
+            for msg in messages:
+                groq_messages.append({"role": msg["role"], "content": msg["content"]})
+            
+            response = groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=groq_messages,
+                temperature=temperature or GROQ_TEMPERATURE,
+                max_tokens=max_tokens or GROQ_MAX_TOKENS,
+                stream=False,
+            )
+            return response.choices[0].message.content
+            
+        elif openai_client:
+            response = openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=messages,
+                temperature=temperature or OPENAI_TEMPERATURE,
+                max_tokens=max_tokens or OPENAI_MAX_TOKENS
+            )
+            return response.choices[0].message.content
+            
+    except Exception as e:
+        logger.error(f"LLM API call failed: {e}")
+        return None
 
-Story context:
-{story_block}
-
-Recent interaction:
-{chat_history[-5:]}
-
-Determine:
-- Is the story progressing?
-- Is gentle intervention needed?
-"""
-        llm.invoke([SystemMessage(content=prompt)])
-    except Exception:
-        pass
+def get_fallback_response():
+    """Get a simple fallback response"""
+    responses = [
+        "Thanks for sharing! Let's continue with the story.",
+        "I appreciate your input. What do others think?",
+        "Good point! The story continues...",
+        "Interesting observation! Let's see what happens next.",
+    ]
+    return random.choice(responses)
 
 # ============================================================
 # 💬 ACTIVE MODERATOR REPLY
@@ -199,52 +176,57 @@ def generate_moderator_reply(
     is_last_chunk: bool = False,
 ) -> str:
     try:
-        style_prompt = ACTIVE_MODE_PROMPTS.get(
-            ACTIVE_MODE, ACTIVE_MODE_PROMPTS["story"]
-        )
-
-        trimmed_history = chat_history[-CHAT_HISTORY_LIMIT:]
+        if is_last_chunk:
+            return ACTIVE_ENDING_MESSAGE
+        
+        style_prompt = ACTIVE_MODE_PROMPTS.get("story")
+        
+        trimmed_history = chat_history[-CHAT_HISTORY_LIMIT:] if chat_history else []
         names = ", ".join(participants) if participants else "everyone"
-
+        
+        chat_text = ""
+        for msg in trimmed_history[-10:]:
+            sender = msg.get('sender', 'Unknown')
+            message = msg.get('message', '')
+            chat_text += f"{sender}: {message}\n"
+        
         prompt = f"""
 {style_prompt}
 
 Story so far:
 {story_block}
 
-Recent chat (last interval):
-{trimmed_history}
+Recent chat:
+{chat_text}
 
-Participants:
-{names}
+Participants: {names}
 
-Instructions:
-- Respond once only
-- Move the story forward by ONE step
-- Be warm and encouraging
+Respond with 1-2 sentences:
+1. Acknowledge the last message if relevant
+2. Continue the story by one step
+
+Your response:
 """
-
-        resp = llm.invoke(
-            [
-                SystemMessage(content="You are a warm classroom story moderator."),
-                HumanMessage(content=prompt),
-            ]
+        
+        response = call_llm(
+            messages=[
+                {"role": "system", "content": "You are a warm classroom story moderator."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7
         )
-
-        text = (resp.content or "").strip()
-        text = re.sub(r"^\s*Moderator[:\-–]?\s*", "", text)
-        text = " ".join(text.split()[:140])
-
-        if is_last_chunk:
-            return ACTIVE_ENDING_MESSAGE
-
-        return text or "The story continues gently."
-
+        
+        if response:
+            text = response.strip()
+            text = re.sub(r"^\s*Moderator[:\-–]?\s*", "", text)
+            text = " ".join(text.split()[:100])
+            return text if text else get_fallback_response()
+        else:
+            return get_fallback_response()
+            
     except Exception as e:
-        logger.error("[generate_moderator_reply]", e)
-        logger.debug(traceback.format_exc())
-        fb = fallback_chatbot.send_message(str(chat_history[-5:]))
-        return fb.content if fb else "Let’s continue together."
+        logger.error(f"[generate_moderator_reply] Error: {e}")
+        return get_fallback_response()
 
 # ============================================================
 # 🕯 PASSIVE STORYTELLER
@@ -257,76 +239,34 @@ def generate_passive_chunk(
     clean = paragraph.strip()
     if not clean:
         return ""
-
+    
     if is_last_chunk:
         return PASSIVE_ENDING_MESSAGE
-
-    if PASSIVE_ENDING_STYLE == "question":
-        return f"{clean} What do you feel might happen next?"
-    elif PASSIVE_ENDING_STYLE == "pause":
-        return f"{clean} The story pauses softly."
-    elif PASSIVE_ENDING_STYLE == "end":
-        return PASSIVE_ENDING_MESSAGE
-    else:
-        return clean
+    
+    return clean
 
 # ============================================================
-# 💡 NUDGE GENERATOR
+# 🎯 ENGAGEMENT RESPONSE
 # ============================================================
-def generate_gpt_nudge(
-    chat_history: List[Dict[str, Any]],
-    story_block: str,
-    nudge_count: int = 1,
-) -> str:
-    try:
-        prompt = f"""
-You are a kind classroom moderator.
-
-Students are quiet.
-Generate ONE warm, gentle encouragement:
-- 1 sentence
-- Soft, human tone
-- Invite without pressure
-- Feel like part of the story
-
-Story context:
-{story_block}
-"""
-        resp = llm.invoke([HumanMessage(content=prompt)])
-        text = (resp.content or "").strip()
-        return re.sub(r"^\s*Moderator[:\-–]?\s*", "", text)
-
-    except Exception:
-        return "What are your thoughts so far?"
-
-# ============================================================
-# 🎯 TWO-PHASE INTERVENTION SYSTEM
-# ============================================================
-
 def generate_engagement_response(
     participants: List[str],
     chat_history: List[Dict[str, Any]],
     story_context: str,
     current_progress: int,
 ) -> str:
-    """
-    Generate an engagement response (question, clarification, discussion prompt)
-    WITHOUT advancing the story.
-    """
+    """Generate an engagement response without advancing the story"""
     try:
-        trimmed_history = chat_history[-CHAT_HISTORY_LIMIT:]
+        trimmed_history = chat_history[-CHAT_HISTORY_LIMIT:] if chat_history else []
         names = ", ".join(participants) if participants else "everyone"
-
-        # Format chat history
+        
         chat_text = ""
-        for msg in trimmed_history[-10:]:  # Last 10 messages
-            chat_text += f"{msg['sender']}: {msg['message']}\n"
-
+        for msg in trimmed_history[-10:]:
+            sender = msg.get('sender', 'Unknown')
+            message = msg.get('message', '')
+            chat_text += f"{sender}: {message}\n"
+        
         prompt = f"""
-You are an intelligent classroom moderator for a story-based learning session.
-
-CURRENT SITUATION:
-Students have been silent or seem confused. You need to ENGAGE them, NOT advance the story.
+You are a classroom moderator. Students need encouragement to discuss.
 
 Story so far:
 {story_context}
@@ -336,148 +276,242 @@ Recent conversation:
 
 Participants: {names}
 
-YOUR TASK:
-Analyze the recent conversation and generate ONE of the following:
+Generate ONE open-ended question about the story so far.
+Do NOT advance the story. Just ask a thoughtful question.
+1 sentence only.
 
-1. If students asked questions → Answer them clearly and ask a follow-up
-2. If students seem confused → Ask a clarifying question about what they don't understand
-3. If students are discussing → Ask a question to deepen the discussion
-4. If students are silent → Ask an open-ended question about the current part of the story
-
-RULES:
-- Do NOT advance the story
-- Do NOT say "let's continue" or "now we move on"
-- Do NOT reveal what happens next
-- Keep response to 1-2 sentences
-- Be warm and encouraging
-- Ask thought-provoking questions about what has ALREADY happened
-- Focus on comprehension, not prediction
-
-Generate your engagement response:
+Your question:
 """
-
-        resp = llm.invoke([
-            SystemMessage(content="You are a Socratic classroom moderator who asks questions rather than lectures."),
-            HumanMessage(content=prompt)
+        
+        response = call_llm([
+            {"role": "user", "content": prompt}
         ])
-
-        text = (resp.content or "").strip()
-        text = re.sub(r"^\s*Moderator[:\-–]?\s*", "", text)
-        text = " ".join(text.split()[:100])  # Limit length
-
-        return text or "What do you think about what we've read so far?"
-
+        
+        if response:
+            text = response.strip()
+            text = re.sub(r"^\s*Moderator[:\-–]?\s*", "", text)
+            return text if text else "What are your thoughts about the story so far?"
+        else:
+            return "What are your thoughts about the story so far?"
+            
     except Exception as e:
-        logger.error(f"[generate_engagement_response] {e}")
+        logger.error(f"[generate_engagement_response] Error: {e}")
         return "What are your thoughts about the story so far?"
 
-
+# ============================================================
+# 🎯 SHOULD ADVANCE STORY
+# ============================================================
 def should_advance_story(
     chat_history: List[Dict[str, Any]],
     story_context: str,
     time_since_last_advance: int,
 ) -> bool:
-    """
-    Use AI to determine if it's appropriate to advance the story.
-    Returns True if story should advance, False if more engagement needed.
-    """
+    """Determine if it's appropriate to advance the story."""
     try:
-        trimmed_history = chat_history[-CHAT_HISTORY_LIMIT:]
-
-        # Format chat history
-        chat_text = ""
-        for msg in trimmed_history[-10:]:
-            chat_text += f"{msg['sender']}: {msg['message']}\n"
-
-        prompt = f"""
-You are an AI decision-maker for a classroom story session.
-
-Time since last story advancement: {time_since_last_advance} seconds
-
-Recent conversation:
-{chat_text}
-
-Story context (current point):
-{story_context[-200:]}...
-
-DECISION TASK:
-Determine if it's time to advance the story to the next part, or if more discussion/engagement is needed.
-
-Advance the story if:
-- Students have discussed the current part thoroughly
-- Students are asking "what happens next?"
-- Discussion has naturally concluded
-- It's been over 60 seconds with good engagement
-
-Do NOT advance if:
-- Students are confused about current events
-- Students are asking questions about what already happened
-- Discussion is still active and productive
-- Students haven't participated yet
-
-Reply with EXACTLY ONE WORD:
-- "ADVANCE" if story should move forward
-- "ENGAGE" if more discussion is needed
-
-Your decision:
-"""
-
-        resp = llm.invoke([HumanMessage(content=prompt)])
-        decision = (resp.content or "").strip().upper()
-
-        # Check if response contains ADVANCE or ENGAGE
-        if "ADVANCE" in decision:
+        if time_since_last_advance > 60:
             return True
-        else:
-            return False
-
+        
+        trimmed_history = chat_history[-10:] if chat_history else []
+        
+        for msg in trimmed_history:
+            content = msg.get('message', '').lower()
+            if 'what happens next' in content or 'then what' in content:
+                return True
+        
+        return False
+        
     except Exception as e:
-        logger.error(f"[should_advance_story] {e}")
-        # Default: if been a while, advance. Otherwise engage.
+        logger.error(f"[should_advance_story] Error: {e}")
         return time_since_last_advance > 60
 
 # ============================================================
-# 🧠 SEMANTIC CLASSIFIER
+# ✅ COMPLETELY FIXED: Generate Personalized Feedback using Groq
 # ============================================================
-def classify_reply_semantic(
-    chat_history: List[Dict[str, Any]],
-    message: str,
-    llm,
+
+# ============================================================
+# ✅ ENHANCED: Generate Detailed Structured Feedback
+# ============================================================
+
+def generate_personalized_feedback(
+    student_name: str,
+    message_count: int,
+    response_times: List[float],
+    story_progress: int,
+    hint_responses: int = 0,
+    behavior_type: str = "moderate",
+    toxic_count: int = 0,
+    off_topic_count: int = 0,
+    chat_history: List[Dict[str, Any]] = None,
+    story_context: str = ""
 ) -> str:
+    """
+    Generate detailed, structured feedback with Strengths, Areas for Improvement, and Next Steps.
+    """
+    
     try:
-        prompt = f"""
-Classify the student's reply into ONE category:
+        # Extract student's actual messages
+        student_messages = []
+        if chat_history:
+            student_messages = [
+                msg.get('message', '') 
+                for msg in chat_history 
+                if msg.get('sender') == student_name
+            ]
+        
+        # Format student messages for the prompt
+        if student_messages:
+            messages_text = "\n".join([f"- {msg}" for msg in student_messages[-5:]])  # Last 5 messages
+            logger.info(f"📝 Found {len(student_messages)} messages from {student_name}")
+            
+            # Find the most interesting/creative message to highlight
+            interesting_message = student_messages[-1] if student_messages else "your contribution"
+        else:
+            messages_text = "No messages sent."
+            interesting_message = "No messages"
+        
+        # Create a detailed prompt for structured feedback
+        prompt = f"""You are an expert educational facilitator providing personalized feedback to a student.
 
-symbolic
-neutral
-reflective
-questioning
-emotional
-imaginative
-causal
-meta
-off-topic
-group
+STUDENT: {student_name}
+MESSAGES SENT: {message_count}
+STORY PROGRESS: {story_progress}%
 
-Reply:
-"{message}"
+STUDENT'S RECENT MESSAGES:
+{messages_text}
+
+INSTRUCTIONS:
+Write a detailed, encouraging feedback with EXACTLY this structure:
+
+1. Start with "Hi {student_name}," on its own line
+2. Then a warm opening sentence acknowledging their specific contribution (mention one specific thing they said)
+3. Then create THREE sections with these exact headers:
+   **Strengths:**
+   **Areas for Improvement:**
+   **Next Steps:**
+
+For each section:
+- Strengths: List 2-3 specific things they did well, referencing their actual messages
+- Areas for Improvement: List 1-2 specific suggestions, based on their participation pattern
+- Next Steps: Give 1-2 actionable recommendations for future sessions
+
+End with an encouraging closing sentence.
+
+Make it warm, specific, and constructive. Use bullet points with * or -.
+
+FEEDBACK:
 """
-        resp = llm.invoke([HumanMessage(content=prompt)])
-        label = (resp.content or "").strip().lower()
+        
+        # Call Groq to generate feedback
+        response = call_llm(
+            messages=[
+                {"role": "system", "content": "You are a warm, supportive teacher who gives detailed, structured feedback to students. Always use the exact format requested."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=600  # Increased for detailed feedback
+        )
+        
+        if response and len(response.strip()) > 50:
+            feedback = response.strip()
+            logger.info(f"✅ Generated detailed feedback for {student_name}")
+            
+            # Format the feedback with the header
+            return f"""
+📊 **Your Feedback**
 
-        allowed = {
-            "symbolic", "neutral", "reflective", "questioning",
-            "emotional", "imaginative", "causal",
-            "meta", "off-topic", "group"
-        }
+{feedback}
+"""
+        else:
+            logger.warning(f"⚠️ Groq returned short response, using fallback for {student_name}")
+            return generate_detailed_fallback(student_name, message_count, student_messages)
+            
+    except Exception as e:
+        logger.error(f"❌ Error generating detailed feedback: {e}")
+        return generate_detailed_fallback(student_name, message_count, student_messages if 'student_messages' in locals() else [])
 
-        return label if label in allowed else "neutral"
 
-    except Exception:
-        return "neutral"
+def generate_detailed_fallback(student_name: str, message_count: int, student_messages: List[str] = None) -> str:
+    """Enhanced fallback with structure when Groq is unavailable"""
+    
+    student_messages = student_messages or []
+    
+    if student_messages:
+        last_message = student_messages[-1][:100] + "..." if len(student_messages[-1]) > 100 else student_messages[-1]
+    else:
+        last_message = "participating in our discussion"
+    
+    if message_count == 0:
+        return f"""
+📊 **Your Feedback**
+
+Hi {student_name},
+
+Thank you for being part of our session today. While you didn't send any messages, your presence was valued.
+
+**Strengths:**
+• You showed up and engaged silently with the material
+• Your attention to the discussion matters
+
+**Areas for Improvement:**
+• Try sharing one small thought next time
+• Even a simple question helps the group
+
+**Next Steps:**
+• Start with one observation in the next session
+• Build confidence by sharing gradually
+
+I look forward to hearing your voice in future discussions!
+"""
+    
+    elif message_count <= 2:
+        return f"""
+📊 **Your Feedback**
+
+Hi {student_name},
+
+Thank you for your contributions today! You shared some thoughtful ideas with us.
+
+**Strengths:**
+• You were willing to participate and share your thoughts
+• Your message about "{last_message}" showed engagement
+
+**Areas for Improvement:**
+• Try to elaborate more on your ideas
+• Build on what others say to create dialogue
+
+**Next Steps:**
+• In the next session, try to share 2-3 times
+• Ask a question to a classmate
+
+Keep up the good work!
+"""
+    
+    else:
+        return f"""
+📊 **Your Feedback**
+
+Hi {student_name},
+
+Thank you for your active participation today! You contributed {message_count} thoughtful messages to our discussion.
+
+**Strengths:**
+• You consistently engaged with the material
+• Your message about "{last_message}" showed creative thinking
+• You helped move the conversation forward
+
+**Areas for Improvement:**
+• Try connecting your ideas to what others have said
+• Consider asking questions to invite others into the discussion
+
+**Next Steps:**
+• In future sessions, try to build on classmates' ideas
+• Challenge yourself to think about character motivations
+
+Great work today! I look forward to hearing more from you.
+"""
 
 # ============================================================
-# 🍃 RANDOM ENDINGS (UNCHANGED)
+# 🍃 RANDOM ENDINGS
 # ============================================================
 def get_random_ending() -> str:
     endings = [
@@ -486,7 +520,6 @@ def get_random_ending() -> str:
         "The tale settled into a peaceful ending.",
         "And the story rested, complete at last.",
         "The journey ended quietly, leaving smiles behind.",
-        "The night grew calm as the story closed.",
         "The final moment arrived, soft and warm.",
     ]
     return random.choice(endings)

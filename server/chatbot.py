@@ -1,58 +1,80 @@
 from __future__ import annotations
-import os, time
-from typing import Optional, Callable, Any
+import os
+import time
+import random
+from typing import Optional
 from dotenv import load_dotenv
+
 load_dotenv()
 
-try:
-    from openai import OpenAI
-    _OPENAI_AVAILABLE = True
-except Exception:
-    _OPENAI_AVAILABLE = False
+class _GroqReply:
+    def __init__(self, content: str): 
+        self.content = content
 
-class _LocalReply:
-    def __init__(self, content: str): self.content = content
-
-class Chatbot:
+class GroqChatbot:
     def __init__(self, system_prompt: str, model_name=None, temperature=None, max_tokens=None):
         self.system_prompt = system_prompt.strip()
-        self.model_name = model_name or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        self.temperature = float(temperature or os.getenv("OPENAI_TEMP", "0.3"))
-        self.max_tokens = int(max_tokens or os.getenv("OPENAI_MAX_TOKENS", "1500"))
-        self.max_retries = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
-        self._use_openai = _OPENAI_AVAILABLE and bool(os.getenv("OPENAI_API_KEY"))
-        self.client = OpenAI() if self._use_openai else None
-        self._max_prompt_chars = int(os.getenv("CHATBOT_MAX_PROMPT_CHARS", "12000"))
-
-    def _retry(self, fn: Callable[[], Any]):
-        delay = 0.8
-        for attempt in range(1, self.max_retries + 1):
-            try: return fn()
-            except Exception as e:
-                if attempt == self.max_retries: raise e
-                time.sleep(delay); delay *= 1.7
-
-    def _truncate(self, text: str) -> str:
-        if len(text) <= self._max_prompt_chars: return text
-        half = self._max_prompt_chars // 2
-        return text[:half] + "\n...\n" + text[-half:]
+        
+        # Get Groq API key
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            print("❌ ERROR: GROQ_API_KEY not found in .env")
+            print("ℹ️ Get FREE API key from: https://console.groq.com/keys")
+            raise ValueError("GROQ_API_KEY not found")
+        
+        # Initialize Groq client
+        try:
+            from groq import Groq
+            self.client = Groq(api_key=api_key)
+        except ImportError:
+            print("❌ Please install groq: pip install groq")
+            raise
+        
+        # Configuration
+        self.model_name = model_name or os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+        self.temperature = float(temperature or os.getenv("GROQ_TEMPERATURE", "0.7"))
+        self.max_tokens = int(max_tokens or os.getenv("GROQ_MAX_TOKENS", "2000"))
+        self.max_retries = int(os.getenv("GROQ_MAX_RETRIES", "3"))
+        
+        print(f"✅ Groq chatbot ready: {self.model_name}")
+        print(f"📊 Config: temp={self.temperature}, tokens={self.max_tokens}")
 
     def send_message(self, prompt: str, thread_id: Optional[str] = None):
-        if not self._use_openai:
-            return _LocalReply(f"(Fallback) Auto-reply: {prompt[:200]}")
-        user_prompt = self._truncate(prompt)
-        def _call():
-            resp = self.client.chat.completions.create(
-                model=self.model_name,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            )
-            return resp.choices[0].message.content
-        try:
-            return _LocalReply(self._retry(_call))
-        except Exception as e:
-            return _LocalReply(f"(Error Fallback) {str(e)[:150]}")
+        """Send message to Groq API"""
+        
+        # Fallback responses
+        fallbacks = [
+            "Thanks for sharing! Let's continue with the story.",
+            "I appreciate your input. What do others think?",
+            "Good point! The story continues...",
+            "Interesting observation! Let's see what happens next.",
+        ]
+        
+        for attempt in range(self.max_retries):
+            try:
+                response = self.client.chat.completions.create(
+                    messages=[
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": prompt},
+                    ],
+                    model=self.model_name,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    stream=False,
+                )
+                
+                content = response.choices[0].message.content
+                print(f"✅ Groq response received ({len(content)} chars)")
+                return _GroqReply(content)
+                
+            except Exception as e:
+                if attempt == self.max_retries - 1:
+                    print(f"❌ All retries failed: {e}")
+                    # Return fallback response
+                    return _GroqReply(random.choice(fallbacks))
+                
+                wait_time = 1 * (attempt + 1)
+                print(f"⚠️ Attempt {attempt + 1} failed, waiting {wait_time}s: {e}")
+                time.sleep(wait_time)
+        
+        return _GroqReply(random.choice(fallbacks))

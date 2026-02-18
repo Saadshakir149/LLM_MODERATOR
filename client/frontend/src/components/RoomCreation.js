@@ -1,7 +1,6 @@
 // ============================================================
 // path: src/components/RoomCreation.jsx
-// FULL VERSION — WITH ULTRA DEBUG LOGS
-// (No deletions. Only added debug logs everywhere.)
+// COMPLETELY FIXED VERSION - Join Room Button Working, No Page Refresh
 // ============================================================
 
 import React, { useEffect, useRef, useState } from "react";
@@ -14,15 +13,10 @@ import {
   MdPlayArrow,
   MdLogin,
   MdPsychology,
+  MdSchool,
+  MdGroups,
+  MdAutoAwesome
 } from "react-icons/md";
-
-// ============================================================
-// 🔥 ULTRA DEBUG LOGGER
-// ============================================================
-const DEBUG = (...args) => {
-  const timestamp = new Date().toISOString();
-  console.log(`%c[ROOMCREATION DEBUG] ${timestamp}`, "color:#aa00ff;", ...args);
-};
 
 export default function RoomCreation() {
   const [roomId, setRoomId] = useState("");
@@ -33,88 +27,45 @@ export default function RoomCreation() {
   const mountedRef = useRef(true);
   const navigate = useNavigate();
 
-  // ------------------------------------------------------------
-  // 🔌 Socket Lifecycle Debug
-  // ------------------------------------------------------------
   useEffect(() => {
     mountedRef.current = true;
-
-    DEBUG("RoomCreation mounted → socket.id:", socket.id);
-
-    const onConnect = () => DEBUG("[socket] CONNECTED:", socket.id);
-    const onConnectErr = (e) =>
-      DEBUG("[socket] CONNECT_ERROR:", e?.message || e);
-    const onDisconnect = (r) =>
-      DEBUG("[socket] DISCONNECTED:", r, "socket.id:", socket.id);
-
-    socket.on("connect", onConnect);
-    socket.on("connect_error", onConnectErr);
-    socket.on("disconnect", onDisconnect);
-
     return () => {
-      DEBUG("RoomCreation unmounted → cleaning socket listeners");
       mountedRef.current = false;
-      socket.off("connect", onConnect);
-      socket.off("connect_error", onConnectErr);
-      socket.off("disconnect", onDisconnect);
     };
   }, []);
 
-  // ------------------------------------------------------------
-  // 🚀 Create Room
-  // ------------------------------------------------------------
+  // ============================================================
+  // ✅ FIXED: Create Room Function
+  // ============================================================
   const createRoom = () => {
-    DEBUG("createRoom CLICKED");
-
-    if (loading) {
-      DEBUG("Already loading → returning");
-      return;
-    }
+    if (loading) return;
 
     const name = userName.trim();
     if (!name) {
-      DEBUG("UserName empty → alert triggered");
       alert("Please enter your name first.");
       return;
     }
 
     setLoading(true);
 
-    DEBUG("Creating room with:", {
-      userName: name,
-      major,
-      activeModerator,
-    });
-
     const cleanup = () => {
-      DEBUG("Cleanup listeners for createRoom");
       socket.off("room_created", onCreated);
       socket.off("error", onError);
     };
 
     const onCreated = ({ room_id }) => {
-      DEBUG("room_created RECEIVED:", room_id);
-
       cleanup();
-      if (!mountedRef.current) {
-        DEBUG("Component unmounted → abort navigation");
-        return;
-      }
-
-      setLoading(false);
-
-      DEBUG("Navigation to ChatRoom:", room_id);
+      if (!mountedRef.current) return;
 
       navigate(
         `/chat/${room_id}?userName=${encodeURIComponent(
           name
         )}&major=${major}&activeModerator=${activeModerator}`
       );
+      // Loading state will clear on unmount
     };
 
     const onError = (err) => {
-      DEBUG("ERROR received on createRoom:", err);
-
       cleanup();
       if (!mountedRef.current) return;
 
@@ -125,12 +76,6 @@ export default function RoomCreation() {
     socket.on("room_created", onCreated);
     socket.on("error", onError);
 
-    DEBUG("EMITTING create_room:", {
-      user_name: name,
-      major,
-      moderatorMode: activeModerator ? "active" : "passive",
-    });
-
     socket.emit("create_room", {
       user_name: name,
       major,
@@ -138,186 +83,271 @@ export default function RoomCreation() {
     });
   };
 
-  // ------------------------------------------------------------
-  // 🔗 Join Room (no socket.emit here)
-  // ------------------------------------------------------------
-  const joinRoom = () => {
-    DEBUG("joinRoom CLICKED");
-
-    if (loading) {
-      DEBUG("Currently loading → cancelled");
-      return;
-    }
+  // ============================================================
+  // ✅ FIXED: Join Room Function - No Page Refresh, Proper Loading
+  // ============================================================
+  const joinRoom = (e) => {
+    // ✅ PREVENT ANY DEFAULT BEHAVIOR (form submission, page refresh)
+    if (e) e.preventDefault();
+    
+    if (loading) return;
 
     const name = userName.trim();
     const id = roomId.trim();
 
     if (!name) {
-      DEBUG("UserName empty → alert");
-      alert("Enter your name.");
+      alert("Please enter your name first.");
       return;
     }
     if (!id) {
-      DEBUG("RoomID empty → alert");
-      alert("Enter Room ID.");
+      alert("Please enter a Room ID.");
       return;
     }
 
-    DEBUG("Navigating to chat → join_room will be emitted inside ChatRoom.jsx");
-
+    // ✅ Show loading state
     setLoading(true);
-    setLoading(false);
-
+    
+    // ✅ Navigate to chat room
     navigate(
-      `/chat/${encodeURIComponent(
-        id
-      )}?userName=${encodeURIComponent(name)}&major=${major}&activeModerator=${
-        activeModerator
-      }`
+      `/chat/${encodeURIComponent(id)}?userName=${encodeURIComponent(name)}&major=${major}&activeModerator=${activeModerator}`
     );
+    
+    // ✅ DO NOT setLoading(false) here - navigation will unmount component
   };
 
-  // ------------------------------------------------------------
-  // 🎨 UI
-  // ------------------------------------------------------------
   return (
-    <div className="min-h-screen w-screen overflow-y-auto bg-gradient-to-br from-green-50 via-blue-50 to-green-100 py-8 px-4">
-      <div className="max-w-4xl mx-auto">
-        {/* Shareable Links Section */}
-        <ShareableLinks />
-
-        {/* Original Create/Join Room Section */}
-        <div className="bg-white/90 backdrop-blur-md p-6 rounded-2xl shadow-lg max-w-md mx-auto border border-blue-100 hover:shadow-[0_0_25px_rgba(59,130,246,0.3)] transition">
-          <h1 className="text-xl font-semibold mb-6 text-center text-blue-700">
-            Or Create / Join Room Manually
-          </h1>
-
-        {/* 👤 User Name */}
-        <div className="relative mb-4">
-          <MdPerson className="absolute left-2 top-3 text-gray-400" size={18} />
-          <input
-            type="text"
-            placeholder="Enter your name"
-            value={userName}
-            onChange={(e) => {
-              DEBUG("Typing userName:", e.target.value);
-              setUserName(e.target.value);
-            }}
-            className="pl-8 border border-gray-200 p-2 w-full rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-green-300"
-            disabled={loading}
-          />
+    <div className="min-h-screen gradient-bg py-8 px-4">
+      <div className="max-w-6xl mx-auto">
+        {/* Hero Section */}
+        <div className="text-center mb-12 animate-slide-up">
+          <div className="flex items-center justify-center gap-3 mb-4">
+            <div className="w-12 h-12 rounded-full bg-gradient-to-r from-indigo-500 to-purple-500 flex items-center justify-center">
+              <MdAutoAwesome className="text-2xl text-white" />
+            </div>
+            <h1 className="text-4xl md:text-5xl font-bold gradient-text">
+              LLM Moderator
+            </h1>
+          </div>
+          <p className="text-lg text-gray-600 max-w-2xl mx-auto">
+            Collaborative storytelling with AI-powered moderation. Create, join, or share rooms instantly.
+          </p>
         </div>
 
-        {/* 🎓 Major */}
-        <label className="block mb-1 text-gray-700 text-sm font-medium">
-          Select your major
-        </label>
+        {/* Main Content */}
+        <div className="grid md:grid-cols-2 gap-8">
+          {/* Left: Shareable Links */}
+          <div className="space-y-8">
+            <ShareableLinks />
+            
+            {/* Stats/Info Card */}
+            <div className="card p-6">
+              <div className="flex items-center gap-3 mb-4">
+                <MdGroups className="text-2xl text-indigo-600" />
+                <h3 className="text-xl font-bold text-gray-800">How It Works</h3>
+              </div>
+              <ul className="space-y-3">
+                <li className="flex items-start gap-2">
+                  <div className="w-6 h-6 rounded-full bg-indigo-100 flex items-center justify-center flex-shrink-0">
+                    <span className="text-xs font-bold text-indigo-600">1</span>
+                  </div>
+                  <span className="text-gray-600">Choose your mode (Active or Passive)</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <div className="w-6 h-6 rounded-full bg-indigo-100 flex items-center justify-center flex-shrink-0">
+                    <span className="text-xs font-bold text-indigo-600">2</span>
+                  </div>
+                  <span className="text-gray-600">Share the link or join manually</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <div className="w-6 h-6 rounded-full bg-indigo-100 flex items-center justify-center flex-shrink-0">
+                    <span className="text-xs font-bold text-indigo-600">3</span>
+                  </div>
+                  <span className="text-gray-600">Collaborate with AI moderation</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <div className="w-6 h-6 rounded-full bg-indigo-100 flex items-center justify-center flex-shrink-0">
+                    <span className="text-xs font-bold text-indigo-600">4</span>
+                  </div>
+                  <span className="text-gray-600">Receive personalized feedback</span>
+                </li>
+              </ul>
+            </div>
+          </div>
 
-        <select
-          value={major}
-          onChange={(e) => {
-            DEBUG("Major changed:", e.target.value);
-            setMajor(e.target.value);
-          }}
-          className="border border-gray-200 p-2 w-full rounded-md mb-4 text-sm focus:outline-none focus:ring-2 focus:ring-blue-300"
-          disabled={loading}
-        >
-          <optgroup label="STEM">
-            <option value="computer_science">Computer Science</option>
-            <option value="data_science">Data Science</option>
-            <option value="engineering">Engineering</option>
-            <option value="mathematics">Mathematics</option>
-          </optgroup>
+          {/* Right: Create/Join Form */}
+          <div className="glass-card p-8 rounded-3xl shadow-2xl border border-white/40">
+            <div className="text-center mb-8">
+              <h2 className="text-2xl font-bold text-gray-800 mb-2">Manual Room Setup</h2>
+              <p className="text-gray-600">Create or join a room with custom settings</p>
+            </div>
 
-          <optgroup label="Humanities">
-            <option value="education">Education</option>
-            <option value="psychology">Psychology</option>
-            <option value="sociology">Sociology</option>
-          </optgroup>
+            <div className="space-y-6">
+              {/* User Info */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  <div className="flex items-center gap-2">
+                    <MdPerson className="text-gray-400" />
+                    <span>Your Name</span>
+                  </div>
+                </label>
+                <input
+                  type="text"
+                  placeholder="Enter your display name"
+                  value={userName}
+                  onChange={(e) => setUserName(e.target.value)}
+                  className="input-field"
+                  disabled={loading}
+                />
+              </div>
 
-          <optgroup label="Business">
-            <option value="business">Business</option>
-            <option value="economics">Economics</option>
-          </optgroup>
+              {/* Major Selection */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  <div className="flex items-center gap-2">
+                    <MdSchool className="text-gray-400" />
+                    <span>Academic Major</span>
+                  </div>
+                </label>
+                <select
+                  value={major}
+                  onChange={(e) => setMajor(e.target.value)}
+                  className="input-field"
+                  disabled={loading}
+                >
+                  <optgroup label="STEM">
+                    <option value="computer_science">Computer Science</option>
+                    <option value="data_science">Data Science</option>
+                    <option value="engineering">Engineering</option>
+                    <option value="mathematics">Mathematics</option>
+                  </optgroup>
+                  <optgroup label="Humanities">
+                    <option value="education">Education</option>
+                    <option value="psychology">Psychology</option>
+                    <option value="sociology">Sociology</option>
+                  </optgroup>
+                  <optgroup label="Business">
+                    <option value="business">Business</option>
+                    <option value="economics">Economics</option>
+                  </optgroup>
+                  <optgroup label="Creative">
+                    <option value="media">Media</option>
+                    <option value="design">Design</option>
+                    <option value="architecture">Architecture</option>
+                  </optgroup>
+                  <optgroup label="Health">
+                    <option value="nursing">Nursing</option>
+                    <option value="health_science">Health Science</option>
+                  </optgroup>
+                </select>
+              </div>
 
-          <optgroup label="Creative / Design">
-            <option value="media">Media</option>
-            <option value="design">Design</option>
-            <option value="architecture">Architecture</option>
-          </optgroup>
+              {/* Moderator Toggle */}
+              <div className="p-4 bg-gradient-to-r from-indigo-50 to-purple-50 rounded-xl">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-full bg-indigo-100 flex items-center justify-center">
+                      <MdPsychology className="text-xl text-indigo-600" />
+                    </div>
+                    <div>
+                      <h4 className="font-semibold text-gray-800">AI Moderator</h4>
+                      <p className="text-sm text-gray-600">
+                        {activeModerator ? "Active engagement mode" : "Passive observation mode"}
+                      </p>
+                    </div>
+                  </div>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={activeModerator}
+                      onChange={(e) => setActiveModerator(e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-gradient-to-r peer-checked:from-indigo-500 peer-checked:to-purple-500"></div>
+                  </label>
+                </div>
+              </div>
 
-          <optgroup label="Health">
-            <option value="nursing">Nursing</option>
-            <option value="health_science">Health Science</option>
-          </optgroup>
-        </select>
+              {/* Action Buttons */}
+              <div className="space-y-4">
+                <button
+                  onClick={createRoom}
+                  disabled={loading || !userName.trim()}
+                  className="w-full btn-primary py-3 flex items-center justify-center gap-2"
+                >
+                  <MdPlayArrow className="text-xl" />
+                  {loading ? "Creating..." : "Create New Room"}
+                </button>
 
-        {/* 🧩 Enable Active Moderator */}
-        <div className="flex items-center mb-4">
-          <input
-            id="active-moderator-toggle"
-            type="checkbox"
-            checked={activeModerator}
-            onChange={(e) => {
-              DEBUG("Active moderator toggled:", e.target.checked);
-              setActiveModerator(e.target.checked);
-            }}
-            className="mr-2 accent-green-500"
-          />
-          <label
-            htmlFor="active-moderator-toggle"
-            className="text-sm text-gray-700 flex items-center gap-1"
-          >
-            <MdPsychology className="text-green-500" /> Enable Active Moderator
-          </label>
-        </div>
+                <div className="relative">
+                  <div className="absolute inset-0 flex items-center">
+                    <div className="w-full border-t border-gray-200"></div>
+                  </div>
+                  <div className="relative flex justify-center text-sm">
+                    <span className="px-4 bg-white text-gray-500">Or join existing room</span>
+                  </div>
+                </div>
 
-        {/* 🏗 Create Room */}
-        <button
-          onClick={createRoom}
-          className={`flex items-center justify-center gap-2 text-white px-3 py-2 rounded-md w-full mb-4 text-sm font-medium transition shadow-md ${
-            loading
-              ? "bg-green-200 cursor-not-allowed"
-              : "bg-gradient-to-r from-green-400 to-green-500 hover:from-green-500 hover:to-green-600 hover:shadow-lg hover:shadow-green-300/50"
-          }`}
-          disabled={loading}
-        >
-          <MdPlayArrow size={16} />
-          {loading ? "Please wait…" : "Create Room"}
-        </button>
-
-        {/* Room ID Input */}
-        <div className="relative mb-4">
-          <MdMeetingRoom
-            className="absolute left-2 top-3 text-gray-400"
-            size={18}
-          />
-          <input
-            type="text"
-            placeholder="Enter Room ID"
-            value={roomId}
-            onChange={(e) => {
-              DEBUG("Typing roomId:", e.target.value);
-              setRoomId(e.target.value);
-            }}
-            className="pl-8 border border-gray-200 p-2 w-full rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-300"
-            disabled={loading}
-          />
-        </div>
-
-        {/* 🔗 Join Room */}
-        <button
-          onClick={joinRoom}
-          className={`flex items-center justify-center gap-2 text-white px-3 py-2 rounded-md w-full text-sm font-medium transition shadow-md ${
-            loading
-              ? "bg-blue-200 cursor-not-allowed"
-              : "bg-gradient-to-r from-blue-400 to-blue-500 hover:from-blue-500 hover:to-blue-600 hover:shadow-lg hover:shadow-blue-300/50"
-          }`}
-          disabled={loading}
-        >
-          <MdLogin size={16} />
-          {loading ? "Joining…" : "Join Room"}
-        </button>
+                {/* ============================================================
+                    ✅ COMPLETELY FIXED: Join Room Section - NO PAGE REFRESH
+                    ============================================================ */}
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    <div className="flex items-center gap-2">
+                      <MdMeetingRoom className="text-gray-400" />
+                      <span>Room ID</span>
+                    </div>
+                  </label>
+                  
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      placeholder="Enter room ID to join"
+                      value={roomId}
+                      onChange={(e) => setRoomId(e.target.value)}
+                      onKeyPress={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault(); // ✅ CRITICAL: Prevent form submission
+                          joinRoom(e);
+                        }
+                      }}
+                      className="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-200 focus:border-indigo-400 outline-none transition"
+                      disabled={loading}
+                    />
+                    <button
+                      onClick={(e) => joinRoom(e)}
+                      disabled={loading || !userName.trim() || !roomId.trim()}
+                      className="px-6 py-2 bg-gradient-to-r from-indigo-500 to-purple-500 text-white rounded-lg hover:from-indigo-600 hover:to-purple-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-2 font-medium whitespace-nowrap"
+                    >
+                      <MdLogin size={18} />
+                      {loading ? "Joining..." : "Join"}
+                    </button>
+                  </div>
+                  
+                  {/* ✅ Helpful validation messages */}
+                  {!userName.trim() && roomId.trim() && (
+                    <p className="text-xs text-red-500 mt-2 flex items-center gap-1">
+                      <span className="w-1.5 h-1.5 bg-red-500 rounded-full"></span>
+                      Please enter your name first
+                    </p>
+                  )}
+                  {userName.trim() && !roomId.trim() && (
+                    <p className="text-xs text-gray-500 mt-2 flex items-center gap-1">
+                      <span className="w-1.5 h-1.5 bg-gray-400 rounded-full"></span>
+                      Enter a room ID to join
+                    </p>
+                  )}
+                  {userName.trim() && roomId.trim() && (
+                    <p className="text-xs text-green-600 mt-2 flex items-center gap-1">
+                      <span className="w-1.5 h-1.5 bg-green-500 rounded-full"></span>
+                      Ready to join: <span className="font-mono bg-green-50 px-1 py-0.5 rounded">
+                        {roomId.substring(0, 8)}...{roomId.substring(roomId.length - 4)}
+                      </span>
+                    </p>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>

@@ -4,8 +4,8 @@ services:
     runtime: python
     region: oregon
     plan: free
-    buildCommand: cd server && pip install -r requirements.txt
-    startCommand: cd server && python app.py
+    buildCommand: pip install -r server/requirements.txt
+    startCommand: cd server && gunicorn app:app
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
@@ -13,7 +13,9 @@ services:
         sync: false
       - key: SUPABASE_SERVICE_KEY
         sync: false
-      - key: OPENAI_API_KEY
+      - key: GROQ_API_KEY  # ✅ ADDED - since you're using Groq
+        sync: false
+      - key: OPENAI_API_KEY  # optional
         sync: false
       - key: FRONTEND_URL
         sync: false

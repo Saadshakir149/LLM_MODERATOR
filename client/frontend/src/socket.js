@@ -1,6 +1,6 @@
 // ============================================================
 // path: src/socket.js
-// 🔥 FULL FIXED VERSION — NO .env REQUIRED — Guaranteed Connect
+// 🔥 ULTRA STABLE FIXED VERSION — POLLING ONLY — NO WEBSOCKET
 // ============================================================
 
 import { io } from "socket.io-client";
@@ -20,20 +20,24 @@ const DEBUG_SOCKET = (...args) => {
 DEBUG_SOCKET("Initializing socket…");
 
 // ============================================================
-// 🟦 FORCE SOCKET TO USE POLLING FIRST, THEN UPGRADE
+// 🟦 CRITICAL FIX: POLLING ONLY - NO WEBSOCKET
 // ============================================================
 
 const SERVER_URL = process.env.REACT_APP_API_URL || "http://localhost:5000";
 
 DEBUG_SOCKET("FORCED SERVER_URL =", SERVER_URL);
 
+// ✅ FIXED: Use ONLY polling transport, disable WebSocket completely
 export const socket = io(SERVER_URL, {
-  transports: ["polling", "websocket"], // 💥 مهم جدًا: يبدأ بـ polling
-  upgrade: true, // يسمح بالترقية إلى websocket
+  transports: ["polling"], // 👈 ONLY polling, NO websocket
+  upgrade: false,          // 👈 NEVER try to upgrade to websocket
   autoConnect: true,
   reconnection: true,
-  reconnectionDelay: 500,
-  reconnectionAttempts: Infinity
+  reconnectionDelay: 1000,
+  reconnectionDelayMax: 5000,
+  reconnectionAttempts: 20,
+  timeout: 20000,
+  forceNew: true
 });
 
 // ============================================================
@@ -41,26 +45,35 @@ export const socket = io(SERVER_URL, {
 // ============================================================
 
 socket.on("connect", () => {
-  DEBUG_SOCKET("CONNECTED ✓ socket.id =", socket.id);
-  DEBUG_SOCKET("Transport Now →", socket.io.engine.transport.name);
+  DEBUG_SOCKET("✅ CONNECTED ✓ socket.id =", socket.id);
+  DEBUG_SOCKET("📡 Transport →", socket.io.engine.transport.name);
 });
 
 socket.on("connect_error", (err) => {
-  DEBUG_SOCKET("CONNECT ERROR →", err?.message || err);
+  DEBUG_SOCKET("❌ CONNECT ERROR →", err?.message || err);
 });
 
 socket.on("disconnect", (reason) => {
-  DEBUG_SOCKET("DISCONNECTED →", reason);
+  DEBUG_SOCKET("🔌 DISCONNECTED →", reason);
 });
 
 socket.on("reconnect_attempt", (attempt) => {
-  DEBUG_SOCKET("RECONNECT ATTEMPT #", attempt);
+  DEBUG_SOCKET("🔄 RECONNECT ATTEMPT #", attempt);
 });
 
 socket.on("reconnect", () => {
-  DEBUG_SOCKET("RECONNECTED ✓ New ID =", socket.id);
+  DEBUG_SOCKET("✅ RECONNECTED ✓ New ID =", socket.id);
 });
 
+socket.on("reconnect_error", (err) => {
+  DEBUG_SOCKET("❌ RECONNECT ERROR →", err?.message || err);
+});
+
+socket.on("reconnect_failed", () => {
+  DEBUG_SOCKET("❌ RECONNECT FAILED - Giving up");
+});
+
+// For debugging - log all received events
 socket.onAny((event, ...args) => {
   DEBUG_SOCKET(`📥 EVENT RECEIVED → "${event}"`, args);
 });
@@ -75,4 +88,7 @@ socket.emit = (eventName, payload, ...rest) => {
   return originalEmit(eventName, payload, ...rest);
 };
 
-DEBUG_SOCKET("Ultra debug patch loaded ✓");
+DEBUG_SOCKET("✅ Ultra stable patch loaded - POLLING ONLY");
+
+// Make socket globally available for debugging
+window.socket = socket;
