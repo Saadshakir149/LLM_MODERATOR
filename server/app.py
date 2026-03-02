@@ -145,17 +145,29 @@ CORS(app, resources={r"/*": {"origins": allowed_origins}}, supports_credentials=
 
 socketio = SocketIO(
     app,
-    cors_allowed_origins=allowed_origins,
+    cors_allowed_origins="*",  # Allow ALL origins temporarily
     async_mode="threading",
     logger=True,
     engineio_logger=True,
-    transports=['polling','websocket'],
-    allow_upgrades=True,
+    transports=['polling'],  # Force polling only (no websocket)
+    allow_upgrades=False,     # Prevent upgrade attempts
     ping_timeout=60,
     ping_interval=25,
-    max_http_buffer_size=1e8
+    max_http_buffer_size=1e8,
+    cors_credentials=True
 )
+@socketio.on('connect')
+def handle_connect():
+    logger.info(f"🔌 SOCKET CONNECTED: {request.sid} from origin: {request.headers.get('Origin', 'Unknown')}")
+    emit('connected', {'data': 'Connected successfully'})
 
+@socketio.on('connect_error')
+def handle_connect_error(error):
+    logger.error(f"❌ SOCKET CONNECT ERROR: {error}")
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    logger.info(f"🔌 SOCKET DISCONNECTED: {request.sid}")
 # ============================================================
 # Room State Management
 # ============================================================
