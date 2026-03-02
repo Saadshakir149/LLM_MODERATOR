@@ -170,6 +170,8 @@ socketio = SocketIO(
     ping_interval=25,
     max_http_buffer_size=1e8,
     cors_credentials=True
+    cookie=False,             # Disable cookies - let session handle it
+    manage_session=False 
 )
 @socketio.on('connect')
 def handle_connect():
