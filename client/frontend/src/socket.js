@@ -14,25 +14,22 @@ const DEBUG_SOCKET = (...args) => {
 
 DEBUG_SOCKET("Initializing socket…");
 
-// ============================================================
-// 🟦 CRITICAL FIX: WEBSOCKET FIRST, POLLING AS FALLBACK
-// ============================================================
-
 const SERVER_URL = process.env.REACT_APP_API_URL || "http://localhost:5000";
 
 DEBUG_SOCKET("FORCED SERVER_URL =", SERVER_URL);
 
-// ✅ FIXED: Use WebSocket FIRST, polling as fallback
+// ✅ FIXED: Aggressive reconnection settings
 export const socket = io(SERVER_URL, {
-  transports: ["websocket", "polling"], // 👈 WebSocket FIRST, polling fallback
-  upgrade: true,                         // 👈 Allow transport upgrades
+  transports: ["websocket", "polling"],
+  upgrade: true,
   autoConnect: true,
   reconnection: true,
-  reconnectionDelay: 1000,
-  reconnectionDelayMax: 5000,
-  reconnectionAttempts: 20,
-  timeout: 30000,                        // 👈 Increased timeout
-  forceNew: true
+  reconnectionDelay: 1000,        // Start with 1 second
+  reconnectionDelayMax: 5000,      // Max 5 seconds between attempts
+  reconnectionAttempts: Infinity,  // Never stop trying
+  timeout: 30000,
+  forceNew: true,
+  randomizationFactor: 0.5         // Add randomness to prevent thundering herd
 });
 
 // ============================================================
@@ -43,16 +40,12 @@ socket.on("connect", () => {
   DEBUG_SOCKET("✅ CONNECTED ✓ socket.id =", socket.id);
   DEBUG_SOCKET("📡 Transport →", socket.io.engine.transport.name);
   
-  // Log which transport is being used
   if (socket.io.engine.transport.name === "websocket") {
     DEBUG_SOCKET("🎯 Using WEBSOCKET - stable connection");
   } else {
     DEBUG_SOCKET("⚠️ Using POLLING - may be slower");
   }
   
-  // ============================================================
-  // 🟢 HEARTBEAT - Keeps connection alive
-  // ============================================================
   // Clear any existing heartbeat
   if (window.heartbeatInterval) {
     clearInterval(window.heartbeatInterval);
@@ -64,7 +57,7 @@ socket.on("connect", () => {
       socket.emit("ping", { timestamp: Date.now() });
       DEBUG_SOCKET("📤 HEARTBEAT → ping");
     }
-  }, 25000); // Send ping every 25 seconds
+  }, 15000); // Send ping every 15 seconds (faster than Render's timeout)
 });
 
 socket.on("connect_error", (err) => {
@@ -74,18 +67,23 @@ socket.on("connect_error", (err) => {
 socket.on("disconnect", (reason) => {
   DEBUG_SOCKET("🔌 DISCONNECTED →", reason);
   
-  // ============================================================
-  // 🟢 CLEAN UP HEARTBEAT ON DISCONNECT
-  // ============================================================
+  // Clean up heartbeat on disconnect
   if (window.heartbeatInterval) {
     clearInterval(window.heartbeatInterval);
     window.heartbeatInterval = null;
   }
+  
+  // If disconnect was not intentional, force reconnect
+  if (reason === "transport close" || reason === "transport error") {
+    DEBUG_SOCKET("🔄 Forcing reconnection...");
+    setTimeout(() => {
+      if (!socket.connected) {
+        socket.connect();
+      }
+    }, 1000);
+  }
 });
 
-// ============================================================
-// 🟢 PONG LISTENER - Confirms heartbeat response
-// ============================================================
 socket.on("pong", (data) => {
   const latency = Date.now() - data.timestamp;
   DEBUG_SOCKET(`📥 HEARTBEAT response → ${latency}ms`);
@@ -105,6 +103,7 @@ socket.on("reconnect_error", (err) => {
 
 socket.on("reconnect_failed", () => {
   DEBUG_SOCKET("❌ RECONNECT FAILED - Giving up");
+  // But we never give up because reconnectionAttempts = Infinity
 });
 
 // Transport upgrade events
@@ -127,12 +126,10 @@ socket.onAny((event, ...args) => {
 const originalEmit = socket.emit.bind(socket);
 
 socket.emit = (eventName, payload, ...rest) => {
-  // Check if socket is connected before emitting
   if (!socket.connected) {
     DEBUG_SOCKET(`⚠️ EMIT ATTEMPT while disconnected - "${eventName}"`, payload);
     DEBUG_SOCKET("⏳ Waiting for connection before emitting...");
     
-    // Wait for connection then emit
     socket.once("connect", () => {
       DEBUG_SOCKET(`📤 EMIT (delayed) → "${eventName}"`, payload);
       originalEmit(eventName, payload, ...rest);
@@ -144,7 +141,6 @@ socket.emit = (eventName, payload, ...rest) => {
   return originalEmit(eventName, payload, ...rest);
 };
 
-DEBUG_SOCKET("✅ Ultra stable patch loaded - WEBSOCKET FIRST with HEARTBEAT");
+DEBUG_SOCKET("✅ Ultra stable patch loaded - WEBSOCKET FIRST with AGGRESSIVE RECONNECT");
 
-// Make socket globally available for debugging
 window.socket = socket;
