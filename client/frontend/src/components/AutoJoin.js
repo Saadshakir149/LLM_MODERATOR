@@ -1,9 +1,10 @@
 // =========================
-// Auto Join Component
-// Automatically assigns user to available room
+// Auto Join Component - FIXED VERSION
+// Automatically assigns user to available room with socket connection check
 // =========================
 import React, { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
+import { socket } from '../socket'; // 👈 IMPORT SOCKET
 
 const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000';
 
@@ -19,7 +20,33 @@ export default function AutoJoin() {
         setLoading(true);
         setError(null);
 
-        // Call backend to get/create room
+        // ============================================================
+        // 🟢 FIX #1: Ensure socket is connected before proceeding
+        // ============================================================
+        if (!socket.connected) {
+          console.log("🔌 AutoJoin: Socket not connected, connecting...");
+          socket.connect();
+          
+          // Wait for connection with timeout
+          await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              reject(new Error("Socket connection timeout"));
+            }, 5000);
+            
+            socket.once("connect", () => {
+              clearTimeout(timeout);
+              console.log("✅ AutoJoin: Socket connected");
+              resolve();
+            });
+          });
+        } else {
+          console.log("✅ AutoJoin: Socket already connected");
+        }
+
+        // ============================================================
+        // 🟢 FIX #2: Call backend to get/create room
+        // ============================================================
+        console.log(`📡 AutoJoin: Fetching room for mode: ${mode}`);
         const response = await fetch(`${API_URL}/join/${mode}`);
         const data = await response.json();
 
@@ -27,14 +54,18 @@ export default function AutoJoin() {
           throw new Error(data.error || 'Failed to join room');
         }
 
-        // Generate anonymous name
-        const userName = `Student ${Math.floor(Math.random() * 1000)}`;
+        console.log("✅ AutoJoin: Room assigned:", data);
 
-        // Navigate to chat room with username as URL parameter
+        // Use the username from backend or generate one
+        const userName = data.user_name || `Student ${Math.floor(Math.random() * 1000)}`;
+
+        // ============================================================
+        // 🟢 FIX #3: Navigate to chat room
+        // ============================================================
         navigate(`/chat/${data.room_id}?userName=${encodeURIComponent(userName)}`);
 
       } catch (err) {
-        console.error('Error joining room:', err);
+        console.error('❌ AutoJoin Error:', err);
         setError(err.message);
         setLoading(false);
       }
