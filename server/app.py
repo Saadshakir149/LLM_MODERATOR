@@ -1,9 +1,12 @@
+from __future__ import annotations
+import eventlet
+eventlet.monkey_patch()
+
 # ============================================================
 # LLM Moderator Server with Supabase Integration - RESEARCH VERSION
 # WITH DESERT SURVIVAL TASK AND ACTIVE/PASSIVE MODERATION
 # Following exact experiment design specifications
 # ============================================================
-from __future__ import annotations
 
 import os
 import uuid
@@ -161,9 +164,9 @@ socketio = SocketIO(
         "http://localhost:3000",
         "http://localhost:3001"
     ],
-    async_mode="threading",
-    logger=True,
-    engineio_logger=True,
+    async_mode="eventlet",
+    logger=False,
+    engineio_logger=False,
     transports=["websocket","polling"],  # Force polling only for now
     allow_upgrades=False,
     ping_timeout=60,

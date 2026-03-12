@@ -12,11 +12,9 @@ import {
   MdVisibility, 
   MdContentCopy,
   MdDashboard,
-  MdBarChart,
   MdHistory,
   MdSecurity,
   MdCheckCircle,
-  MdWarning,
   MdEdit,
   MdCancel,
   MdSave,
@@ -24,10 +22,8 @@ import {
   MdDownload,
   MdFileDownload,
   MdExitToApp,
-  MdPlayArrow,
   MdStop,
   MdChat,
-  MdPerson,
   MdGroup,
   MdPsychology, // ✅ ADDED - for Active Mode icon
   MdAutoMode  
@@ -479,7 +475,6 @@ function NavItem({ active, onClick, icon, label, badge }) {
 // Modern Dashboard View
 function DashboardView({ stats, rooms }) {
   const activeRooms = rooms.filter(r => r.status === 'active').length;
-  const waitingRooms = rooms.filter(r => r.status === 'waiting').length;
   const completedRooms = rooms.filter(r => r.status === 'completed').length;
   const totalParticipants = rooms.reduce((sum, room) => sum + (room.actual_participant_count || 0), 0);
   const uniqueUsers = new Set();
