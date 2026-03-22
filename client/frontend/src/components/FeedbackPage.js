@@ -3,7 +3,7 @@
 // =========================
 import React, { useEffect, useState } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
-import { MdArrowBack, MdDownload, MdShare, MdStar, MdStarBorder } from "react-icons/md";
+import { MdArrowBack, MdDownload, MdShare, MdStar } from "react-icons/md";
 
 export default function FeedbackPage() {
   const navigate = useNavigate();

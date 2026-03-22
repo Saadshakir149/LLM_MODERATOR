@@ -1,9 +1,12 @@
+from __future__ import annotations
+import eventlet
+eventlet.monkey_patch()
+
 # ============================================================
 # LLM Moderator Server with Supabase Integration - RESEARCH VERSION
 # WITH DESERT SURVIVAL TASK AND ACTIVE/PASSIVE MODERATION
 # Following exact experiment design specifications
 # ============================================================
-from __future__ import annotations
 
 import os
 import uuid
@@ -130,48 +133,21 @@ load_dotenv()
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000").strip()
 if FRONTEND_URL.endswith('/'):
     FRONTEND_URL = FRONTEND_URL[:-1]
-allowed_origins = [
-    "http://localhost:3000",
-    "http://localhost:3001",
-    "http://127.0.0.1:3000",
-    "http://127.0.0.1:3001",
-    FRONTEND_URL
-]
+allowed_origins = "*"
 
 logger.info(f"🔒 CORS allowed origins: {allowed_origins}")
 
 app = Flask(__name__)
-CORS(app, resources={
-    r"/*": {
-        "origins": [
-            "https://llm-moderator-39gf.vercel.app",
-            "http://localhost:3000",
-            "http://localhost:3001"
-        ],
-        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"],
-        "supports_credentials": True
-    }
-})
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 socketio = SocketIO(
     app,
-    cors_allowed_origins=[
-        "https://llm-moderator-39gf.vercel.app",
-        "http://localhost:3000",
-        "http://localhost:3001"
-    ],
-    async_mode="threading",
-    logger=True,
-    engineio_logger=True,
-    transports=["websocket","polling"],  # Force polling only for now
-    allow_upgrades=False,
+    cors_allowed_origins="*",
+    async_mode="eventlet",
+    logger=False,
+    engineio_logger=False,
     ping_timeout=60,
     ping_interval=25,
-    max_http_buffer_size=1e8,
-    cors_credentials=True,
-    cookie=False,             # Disable cookies - let session handle it
-    manage_session=False 
 )
 @socketio.on('connect')
 def handle_connect():

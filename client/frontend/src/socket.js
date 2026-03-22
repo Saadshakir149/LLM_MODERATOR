@@ -20,16 +20,15 @@ DEBUG_SOCKET("FORCED SERVER_URL =", SERVER_URL);
 
 // ✅ FIXED: Aggressive reconnection settings
 export const socket = io(SERVER_URL, {
-  transports: ["websocket", "polling"],
+  transports: ["polling", "websocket"],
   upgrade: true,
   autoConnect: true,
   reconnection: true,
-  reconnectionDelay: 1000,        // Start with 1 second
-  reconnectionDelayMax: 5000,      // Max 5 seconds between attempts
-  reconnectionAttempts: Infinity,  // Never stop trying
-  timeout: 30000,
-  forceNew: true,
-  randomizationFactor: 0.5         // Add randomness to prevent thundering herd
+  reconnectionDelay: 1000,
+  reconnectionDelayMax: 10000,
+  reconnectionAttempts: 15,
+  timeout: 60000,
+  randomizationFactor: 0.5,
 });
 
 // ============================================================
