@@ -20,7 +20,8 @@ DEBUG_SOCKET("FORCED SERVER_URL =", SERVER_URL);
 
 // ✅ FIXED: Aggressive reconnection settings
 export const socket = io(SERVER_URL, {
-  transports: ["polling", "websocket"],
+  // WebSocket first reduces time-to-first-byte vs long-polling (important on Vercel → remote API).
+  transports: ["websocket", "polling"],
   upgrade: true,
   autoConnect: true,
   reconnection: true,

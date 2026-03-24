@@ -150,7 +150,11 @@ else:
 load_dotenv()
 
 # Get frontend URL first (needed for CORS)
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000").strip()
+# Override with http://localhost:3000 when running the React app locally.
+FRONTEND_URL = os.getenv(
+    "FRONTEND_URL",
+    "https://llm-moderator-39gf.vercel.app",
+).strip()
 if FRONTEND_URL.endswith('/'):
     FRONTEND_URL = FRONTEND_URL[:-1]
 allowed_origins = "*"
@@ -1210,22 +1214,31 @@ def create_room_handler(data):
 
         join_room(room_id)
 
-        add_message(
-            room_id=room_id,
-            username="Moderator",
-            message=WELCOME_MESSAGE,
-            message_type="system"
-        )
-
+        # Tell the client immediately — do not block on welcome message DB write + broadcast.
         emit("joined_room", {"room_id": room_id}, to=request.sid)
         emit("room_created", {"room_id": room_id, "mode": mode}, to=request.sid)
-        emit(
-            "receive_message",
-            {"sender": "Moderator", "message": WELCOME_MESSAGE},
-            room=room_id,
-        )
 
-        socketio.start_background_task(lambda: start_task_for_room(room_id))
+        def _welcome_and_start_task():
+            try:
+                add_message(
+                    room_id=room_id,
+                    username="Moderator",
+                    message=WELCOME_MESSAGE,
+                    message_type="system",
+                )
+                socketio.emit(
+                    "receive_message",
+                    {"sender": "Moderator", "message": WELCOME_MESSAGE},
+                    room=room_id,
+                )
+            except Exception as wel_exc:
+                logger.error(f"❌ Welcome message failed for room {room_id}: {wel_exc}")
+            try:
+                start_task_for_room(room_id)
+            except Exception as task_exc:
+                logger.error(f"❌ start_task_for_room failed for {room_id}: {task_exc}")
+
+        socketio.start_background_task(_welcome_and_start_task)
 
     except Exception as e:
         logger.error(f"❌ Error creating room: {e}", exc_info=True)

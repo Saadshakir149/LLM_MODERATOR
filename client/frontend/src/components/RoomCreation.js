@@ -47,50 +47,72 @@ export default function RoomCreation() {
   setLoading(true);
   console.log("Creating room for:", name);
 
-  // Helper function to actually emit the event
+  let connectTimeoutId = null;
+
+  const cleanup = () => {
+    if (connectTimeoutId) {
+      clearTimeout(connectTimeoutId);
+      connectTimeoutId = null;
+    }
+  };
+
+  const onRoomCreated = (data) => {
+    cleanup();
+    socket.off("error", onError);
+    console.log("Room created:", data);
+    if (!mountedRef.current) return;
+    setLoading(false);
+    navigate(
+      `/chat/${data.room_id}?userName=${encodeURIComponent(name)}&major=${major}&activeModerator=${activeModerator}`
+    );
+  };
+
+  const onError = (error) => {
+    cleanup();
+    socket.off("room_created", onRoomCreated);
+    console.error("Room creation error:", error);
+    if (!mountedRef.current) return;
+    setLoading(false);
+    const msg =
+      typeof error === "string"
+        ? error
+        : error?.message || "Failed to create room. Please try again.";
+    alert(msg);
+  };
+
+  // Register handlers BEFORE emit — otherwise a fast server response can be missed.
+  socket.once("room_created", onRoomCreated);
+  socket.once("error", onError);
+
   const emitCreateRoom = () => {
     console.log("Emitting create_room event");
     socket.emit("create_room", {
       user_name: name,
       major: major,
-      moderatorMode: activeModerator ? "active" : "passive"
+      moderatorMode: activeModerator ? "active" : "passive",
     });
   };
 
-  // Check connection status
   if (socket.connected) {
     emitCreateRoom();
   } else {
     console.log("Socket not connected, connecting now...");
     socket.connect();
-    
-    // Wait for connection
     socket.once("connect", () => {
       console.log("Socket connected, now emitting");
       emitCreateRoom();
     });
-    
-    // Connection timeout
-    setTimeout(() => {
+    connectTimeoutId = setTimeout(() => {
       if (!socket.connected) {
-        setLoading(false);
-        alert("Connection timeout. Please check your internet and try again.");
+        socket.off("room_created", onRoomCreated);
+        socket.off("error", onError);
+        if (mountedRef.current) {
+          setLoading(false);
+          alert("Connection timeout. Please check your internet and try again.");
+        }
       }
-    }, 5000);
+    }, 15000);
   }
-
-  // Listen for response
-  socket.once("room_created", (data) => {
-    console.log("Room created:", data);
-    setLoading(false);
-    navigate(`/chat/${data.room_id}?userName=${encodeURIComponent(name)}&major=${major}&activeModerator=${activeModerator}`);
-  });
-
-  socket.once("error", (error) => {
-    console.error("Room creation error:", error);
-    setLoading(false);
-    alert(error.message || "Failed to create room. Please try again.");
-  });
 };
   // ============================================================
   // ✅ FIXED: Join Room Function - No Page Refresh, Proper Loading

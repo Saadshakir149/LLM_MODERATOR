@@ -88,7 +88,7 @@ In Render dashboard, go to **Environment** and add:
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_KEY=your_service_role_key
 OPENAI_API_KEY=sk-your-openai-key
-FRONTEND_URL=https://your-frontend.vercel.app
+FRONTEND_URL=https://llm-moderator-39gf.vercel.app
 PYTHON_VERSION=3.11.0
 ```
 
