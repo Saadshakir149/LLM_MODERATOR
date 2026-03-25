@@ -89,8 +89,28 @@ export default function ChatRoom() {
   const [timeWarning, setTimeWarning] = useState(false);
   const [draggedItem, setDraggedItem] = useState(null);
   const [languageWarning, setLanguageWarning] = useState(null);
+  const languageWarningTimerRef = useRef(null);
 
   const messagesEndRef = useRef(null);
+
+  const dismissLanguageWarning = useCallback(() => {
+    if (languageWarningTimerRef.current) {
+      window.clearTimeout(languageWarningTimerRef.current);
+      languageWarningTimerRef.current = null;
+    }
+    setLanguageWarning(null);
+  }, []);
+
+  const showLanguageWarningBanner = useCallback((text) => {
+    if (languageWarningTimerRef.current) {
+      window.clearTimeout(languageWarningTimerRef.current);
+    }
+    setLanguageWarning(text);
+    languageWarningTimerRef.current = window.setTimeout(() => {
+      setLanguageWarning(null);
+      languageWarningTimerRef.current = null;
+    }, 8000);
+  }, []);
 
   // ============================================================
   // 🔊 LOCAL SEND SOUND
@@ -191,12 +211,13 @@ export default function ChatRoom() {
       });
     });
 
-    socket.on("warning_message", (data) => {
+    const onLanguageWarningPayload = (data) => {
       if (data?.type === "language_warning" && data.message) {
-        setLanguageWarning(data.message);
-        window.setTimeout(() => setLanguageWarning(null), 8000);
+        showLanguageWarningBanner(data.message);
       }
-    });
+    };
+    socket.on("language_warning", onLanguageWarningPayload);
+    socket.on("warning_message", onLanguageWarningPayload);
 
     socket.on("participants_update", (data) => {
       setParticipants(data.participants || []);
@@ -247,6 +268,10 @@ export default function ChatRoom() {
     }
 
     return () => {
+      if (languageWarningTimerRef.current) {
+        window.clearTimeout(languageWarningTimerRef.current);
+        languageWarningTimerRef.current = null;
+      }
       socket.off("connect");
       socket.off("disconnect");
       socket.off("connect_error");
@@ -257,9 +282,10 @@ export default function ChatRoom() {
       socket.off("time_warning");
       socket.off("ranking_submitted");
       socket.off("session_ended");
-      socket.off("warning_message");
+      socket.off("language_warning", onLanguageWarningPayload);
+      socket.off("warning_message", onLanguageWarningPayload);
     };
-  }, [roomId, userName, navigate]);
+  }, [roomId, userName, navigate, showLanguageWarningBanner]);
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -458,11 +484,21 @@ export default function ChatRoom() {
     <div className="flex flex-col h-screen bg-gradient-to-br from-blue-50 via-indigo-50 to-purple-50">
       {languageWarning && (
         <div
-          className="fixed top-4 left-1/2 -translate-x-1/2 z-[60] max-w-lg w-[calc(100%-2rem)] rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 shadow-lg flex items-start gap-3"
+          className="fixed top-4 left-1/2 -translate-x-1/2 z-[60] max-w-lg w-[calc(100%-2rem)] rounded-xl border-l-4 border-amber-500 border border-amber-200 bg-amber-50 px-4 py-3 shadow-lg animate-pulse"
           role="alert"
         >
-          <MdWarning className="text-amber-600 flex-shrink-0 mt-0.5" size={22} />
-          <p className="text-sm text-amber-900">{languageWarning}</p>
+          <div className="flex items-start gap-3">
+            <MdWarning className="text-amber-600 flex-shrink-0 mt-0.5" size={22} />
+            <p className="text-sm text-amber-800 flex-1 pr-1">{languageWarning}</p>
+            <button
+              type="button"
+              onClick={dismissLanguageWarning}
+              className="flex-shrink-0 text-amber-600 hover:text-amber-900 text-lg leading-none px-1"
+              aria-label="Dismiss warning"
+            >
+              ×
+            </button>
+          </div>
         </div>
       )}
 
@@ -591,6 +627,12 @@ export default function ChatRoom() {
                           {isCurrentUser ? 'You' : msg.sender}
                         </span>
                         <span className="text-xs text-gray-500">{timestamp}</span>
+                        {isFlagged && !isModerator && !isSystem && (
+                          <span className="text-xs text-amber-600 flex items-center gap-0.5">
+                            <MdWarning className="inline" size={12} />
+                            Flagged
+                          </span>
+                        )}
                       </div>
                       
                       <div

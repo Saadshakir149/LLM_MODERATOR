@@ -106,6 +106,7 @@ from prompts import (
     generate_personalized_feedback,
     get_random_ending,
     check_inappropriate_language,
+    get_language_severity,
     get_fallback_feedback,
 )
 
@@ -1360,29 +1361,45 @@ def send_message_handler(data):
 
         is_inappropriate, bad_words = check_inappropriate_language(msg)
         if is_inappropriate:
-            logger.warning(f"⚠️ Inappropriate language detected from {sender}: {bad_words}")
-            warning_msg = (
-                "Please keep our discussion professional and respectful. "
-                "Let's focus on the desert survival task."
+            severity = get_language_severity(bad_words)
+            logger.warning(
+                f"⚠️ Inappropriate language from {sender}: {bad_words} (severity: {severity})"
             )
-            add_message(
-                room_id=room_id,
-                username="Moderator",
-                message=warning_msg,
-                message_type="moderator",
-                metadata={
-                    "target_user": sender,
-                    "trigger": "inappropriate_language",
-                    "bad_words": bad_words,
-                },
-            )
+            if severity == "HIGH":
+                warning_msg = (
+                    "Your message contained inappropriate language. "
+                    "Please keep our discussion professional, respectful, and focused on the "
+                    "desert survival task. Continued violations may affect your participation."
+                )
+            elif severity == "MEDIUM":
+                warning_msg = (
+                    "Please use more professional language. Let's focus on the desert survival task."
+                )
+            else:
+                warning_msg = (
+                    "Please keep our discussion professional and focused on the task."
+                )
+            sample = bad_words[0] if bad_words else ""
+            if sample:
+                warning_msg += f" (detected: {sample})"
+
+            warning_payload = {
+                "message": warning_msg,
+                "type": "language_warning",
+                "severity": severity,
+                "detected_words": bad_words,
+            }
             participant_record = get_participant_by_username(room_id, sender)
             if participant_record and participant_record.get("socket_id"):
+                sid = participant_record["socket_id"]
+                socketio.emit("language_warning", warning_payload, room=sid)
                 socketio.emit(
                     "warning_message",
                     {"message": warning_msg, "type": "language_warning"},
-                    room=participant_record["socket_id"],
+                    room=sid,
                 )
+                logger.info(f"📨 Sent language warning to {sender} (severity={severity})")
+
             log_moderator_intervention(room_id, "language_warning", sender)
 
             add_message(
@@ -1390,7 +1407,12 @@ def send_message_handler(data):
                 username=sender,
                 message=msg,
                 message_type="chat",
-                metadata={"word_count": word_count, "flagged": True, "bad_words": bad_words},
+                metadata={
+                    "word_count": word_count,
+                    "flagged": True,
+                    "bad_words": bad_words,
+                    "severity": severity,
+                },
             )
 
             emit(
@@ -1401,10 +1423,11 @@ def send_message_handler(data):
                     "message": msg,
                     "timestamp": datetime.now().isoformat(),
                     "flagged": True,
+                    "flag_reason": "inappropriate language",
                 },
                 room=room_id,
             )
-            logger.info(f"✅ Flagged message stored and warning sent in room {room_id}")
+            logger.info(f"✅ Flagged message from {sender} broadcast (severity={severity})")
             return
 
         add_message(
@@ -1583,7 +1606,9 @@ def handle_end_session(data):
             inappropriate_count = 0
             for msg in participant_messages:
                 if msg.get('username') == username:
-                    is_bad, _ = check_inappropriate_language(msg.get('message', ''))
+                    is_bad, _ = check_inappropriate_language(
+                        msg.get("message", ""), allow_casual_slang=True
+                    )
                     if is_bad:
                         inappropriate_count += 1
 

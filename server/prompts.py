@@ -294,66 +294,298 @@ def format_items_list():
     return "\n".join([f"• {item}" for item in DESERT_ITEMS])
 
 # ============================================================
-# 🚫 SLANG/INAPPROPRIATE LANGUAGE DETECTION
+# 🚫 INAPPROPRIATE LANGUAGE DETECTION (comprehensive, research logging)
 # ============================================================
-BAD_PHRASES = [
+# Multi-word phrases matched by substring. Longer phrases are checked first so
+# "shut the fuck up" wins over "shut up". Overlapping hits are reduced by
+# blanking matched spans in a working copy before token scans.
+#
+# NOTE: Bare tokens like "die", "kill", "death" are omitted — desert-survival
+# discussions mention risk of death legitimately. Violent/threatening *phrases*
+# are still caught (e.g. "kill yourself", "kys", "fuck you").
+# ============================================================
+
+_INAPPROPRIATE_PHRASES_RAW = (
+    # Aggressive commands / profane phrases
+    "shut the fuck up",
+    "what the fuck",
+    "what the hell",
+    "fucking hell",
+    "get the fuck out",
+    "fuck off",
+    "fuck you",
+    "fuck u",
+    "f u",
+    "suck my dick",
+    "suck my cock",
+    "suck it",
+    "eat shit",
+    "kiss my ass",
+    "go to hell",
+    "go die",
     "shut up",
     "shutup",
+    "stfuu",
     "stfu",
     "gtfo",
-]
+    "son of a bitch",
+    "piece of shit",
+    "bullshit",
+    "horseshit",
+    "motherfucker",
+    "dick head",
+    "cocksucker",
+    "jerk off",
+    "jerkoff",
+    "kill yourself",
+    "kys",
+    "fuck you up",
+    # Urdu / Roman Urdu (phrases)
+    "teri maa ki",
+    "maa ki",
+    "bhen ki",
+    "behenchod",
+    "behanchod",
+    "bhenchod",
+    "bhenchood",
+    "benchod",
+    "madarchod",
+    "maderchod",
+    "maachod",
+    "maa chod",
+    "bhosdike",
+    "bhosdiwala",
+    "bhosri",
+    "bhosra",
+    "chutiya",
+    "chutiye",
+    "chutya",
+    "choot",
+    "haramzada",
+    "haramzaada",
+    "ullu ka patha",
+    "ullu ka pattha",
+    "terimaaki",
+    "suar ka bacha",
+    # Threatening (phrased)
+    "beat you",
+    "beat u",
+    "hit you",
+    "hit u",
+    "slap you",
+    "slap u",
+    "punch you",
+    "punch u",
+    "fight you",
+    "fight u",
+    "destroy you",
+    "end you",
+    "ruin you",
+    "mess you up",
+    "wreck you",
+    "hate you",
+    "i hate u",
+    # Academic / plagiarism insults (phrases)
+    "you cheated",
+    "you're cheating",
+    "youre cheating",
+)
 
-# Single-token terms matched with word boundaries (avoids "class" → "ass", etc.)
-BAD_WORDS = [
-    "fuck",
-    "shit",
-    "damn",
-    "hell",
-    "bitch",
-    "crap",
-    "ass",
-    "stupid",
-    "dumb",
-    "idiot",
-    "moron",
-    "loser",
-    "jerk",
-    "hate",
-    "kill",
-    "die",
-    "useless",
-    "worthless",
-    "wtf",
-    "omg",
-    "lmfao",
-    "lmao",
-    "lol",
-    "rofl",
-]
+INAPPROPRIATE_PHRASES: tuple[str, ...] = tuple(
+    sorted(set(_INAPPROPRIATE_PHRASES_RAW), key=len, reverse=True)
+)
+
+# Single-token / compact terms: word-boundary match in unscanned portions only.
+_INAPPROPRIATE_TOKENS_RAW: frozenset[str] = frozenset(
+    {
+        # Profanity
+        "fuck",
+        "fucking",
+        "fucked",
+        "fucker",
+        "shit",
+        "shitting",
+        "bullshit",
+        "shitty",
+        "damn",
+        "damned",
+        "goddamn",
+        "goddamned",
+        "hell",
+        "asshole",
+        "asshat",
+        "asswipe",
+        "assclown",
+        "bitch",
+        "bitching",
+        "bitched",
+        "bitchy",
+        "dick",
+        "dickhead",
+        "dickwad",
+        "dicksucker",
+        "cock",
+        "cockhead",
+        "pussy",
+        "cunt",
+        "cunts",
+        "cuntface",
+        "twat",
+        "wanker",
+        "bastard",
+        # Insults / slurs (use with care: academic / hostile tone)
+        "stupid",
+        "stoopid",
+        "dumbass",
+        "dumbfuck",
+        "dumb",
+        "idiot",
+        "idiotic",
+        "idiots",
+        "moron",
+        "moronic",
+        "loser",
+        "retard",
+        "retarded",
+        "tard",
+        "pathetic",
+        "useless",
+        "worthless",
+        "simp",
+        "cuck",
+        "nazi",
+        "hitler",
+        "rapist",
+        "pedo",
+        "pedophile",
+        # Urdu tokens (strong)
+        "chut",
+        "bhosdike",
+        "madarchod",
+        "harami",
+        "bewakoof",
+        "beywaqoof",
+        "nalayak",
+        "nalaik",
+        "kameena",
+        "kameeni",
+        "lafanga",
+        "lafangi",
+        "kutta",
+        "kutti",
+        "kutte",
+        "suar",
+        "gadha",
+        "gadhi",
+        "randi",
+        "randwa",
+        "lauda",
+        "laude",
+        "loda",
+        "lund",
+        "lundu",
+        "gandu",
+        "gand",
+        "pagal",
+        "paagal",
+        "deewana",
+        "sala",
+        "salaa",
+        # Internet / casual (flagged for professional classroom tone)
+        "wtf",
+        "omfg",
+        "omg",
+        "lmfao",
+        "lmao",
+        "rofl",
+        "roflmao",
+        "lolz",
+        "lel",
+        "smh",
+        "fml",
+        # Other
+        "jerk",
+        "jerks",
+        "freakshow",
+        "weirdo",
+        "psycho",
+        "psychotic",
+        "garbage",
+        "trashy",
+        "snowflake",
+        "triggered",
+        "crybaby",
+        "whiner",
+        "scrublord",
+        "noob",
+        "newb",
+        "cheater",
+        "plagiarism",
+        "fraud",
+        "poser",
+        "wannabe",
+        "nerd",
+        "dork",
+        "dweeb",
+        "scrub",
+        # Slang insults
+        "sucks",
+        "suckass",
+        # Severe slurs (zero tolerance)
+        "nigger",
+        "nigga",
+        "faggot",
+        "fag",
+        "chink",
+        "spic",
+        "kike",
+    }
+)
+
+# Very short tokens excluded (too many false positives: "ass" in "class", "fu" as typo)
+# "ass" alone is skipped; "asshole" etc. kept.
 
 
-def check_inappropriate_language(message: str) -> tuple[bool, List[str]]:
+def _tokens_for_scan(message_lower: str) -> list[str]:
+    """Word-boundary token hits on full normalized message."""
+    found: list[str] = []
+    for tok in _INAPPROPRIATE_TOKENS_RAW:
+        if re.search(r"(?<!\w)" + re.escape(tok) + r"(?!\w)", message_lower):
+            found.append(tok)
+    return found
+
+
+_CASUAL_SINGLE_OK = frozenset(
+    {"lol", "lmao", "lmfao", "rofl", "roflmao", "omg", "wtf", "smh", "fml", "lolz", "lel", "omfg"}
+)
+
+
+def check_inappropriate_language(
+    message: str, allow_casual_slang: bool = False
+) -> tuple[bool, List[str]]:
     """
-    Detect inappropriate language for a classroom-style discussion.
-    Returns (is_inappropriate, matched_terms).
+    Comprehensive inappropriate-language check for moderated discussions.
+    Returns (is_inappropriate, matched_terms) for logging and warnings.
+
+    allow_casual_slang: If True, a single hit that is only casual chat abbreviations
+    (e.g. lol, omg) does not count — avoids the AI moderator interrupting on filler.
     """
     if not message or not message.strip():
         return False, []
 
     message_lower = message.lower()
-    found: List[str] = []
+    work = message_lower
+    found: list[str] = []
 
-    for phrase in BAD_PHRASES:
-        if phrase in message_lower:
+    for phrase in INAPPROPRIATE_PHRASES:
+        if phrase in work:
             found.append(phrase)
+            work = work.replace(phrase, " " * len(phrase))
 
-    for word in BAD_WORDS:
-        if re.search(r"(?<!\w)" + re.escape(word) + r"(?!\w)", message_lower):
-            found.append(word)
+    found.extend(_tokens_for_scan(work))
 
-    # De-duplicate while preserving order
-    seen = set()
-    found_words = []
+    seen: set[str] = set()
+    found_words: list[str] = []
     for w in found:
         if w not in seen:
             seen.add(w)
@@ -362,26 +594,49 @@ def check_inappropriate_language(message: str) -> tuple[bool, List[str]]:
     if not found_words:
         return False, []
 
-    if len(found_words) >= 2:
-        return True, found_words
+    if allow_casual_slang and len(found_words) == 1 and found_words[0] in _CASUAL_SINGLE_OK:
+        return False, []
 
-    aggressive_patterns = [
-        "you are",
-        "you're",
-        "youre",
-        "your idea",
-        "you idiot",
-        "you stupid",
-        "u r",
-        "so stupid",
-        "so dumb",
-        "very stupid",
-        "very dumb",
-    ]
-    if any(p in message_lower for p in aggressive_patterns):
-        return True, found_words
+    logger.warning(
+        "🚫 Inappropriate language detected: %s in: %.50s...",
+        found_words,
+        message,
+    )
+    return True, found_words
 
-    return False, found_words
+
+_HIGH_SEVERITY_FRAGMENTS: frozenset[str] = frozenset(
+    """
+    kill yourself kys suicide murder rapist pedo pedophile nazi hitler
+    cunt fuck fucking shitter motherfucker cocksucker
+    bhenchod madarchod bhosdike chutiya haramzada
+    kill u kill you die faggot nigger
+    """.split()
+)
+
+
+_MEDIUM_SEVERITY_FRAGMENTS: frozenset[str] = frozenset(
+    """
+    shit asshole bitch dumbass idiot moron loser retard stupid dumb jerk
+    whore slut pussy dick cock cunt twat
+    shut stfu gtfo fuck ass wank
+    pagal gandu kutta chut lund
+    """.split()
+)
+
+
+def get_language_severity(bad_words: List[str]) -> str:
+    """HIGH / MEDIUM / LOW from matched terms (worst wins)."""
+    if not bad_words:
+        return "LOW"
+    blob = " ".join(bad_words).lower()
+    for w in sorted(_HIGH_SEVERITY_FRAGMENTS, key=len, reverse=True):
+        if w in blob:
+            return "HIGH"
+    for w in sorted(_MEDIUM_SEVERITY_FRAGMENTS, key=len, reverse=True):
+        if w in blob:
+            return "MEDIUM"
+    return "LOW"
 
 # ============================================================
 # 🟢 ACTIVE MODERATOR PROMPTS (Research Version)
@@ -494,7 +749,9 @@ def generate_active_moderator_response(
             
             # Only check if it's not a question
             if '?' not in last_content:
-                is_inappropriate, bad_words = check_inappropriate_language(last_content)
+                is_inappropriate, bad_words = check_inappropriate_language(
+                    last_content, allow_casual_slang=True
+                )
                 if is_inappropriate:
                     warning_msg = f"{last_sender}, please keep our discussion professional and academic. Let's focus on the desert survival task."
                     logger.info(f"⚠️ Inappropriate language detected from {last_sender}: {bad_words}")
@@ -761,7 +1018,7 @@ def generate_personalized_feedback(
 
         inappropriate_from_text = 0
         for msg in student_messages:
-            is_bad, _ = check_inappropriate_language(msg)
+            is_bad, _ = check_inappropriate_language(msg, allow_casual_slang=True)
             if is_bad:
                 inappropriate_from_text += 1
 
