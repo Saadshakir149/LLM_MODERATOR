@@ -3,6 +3,10 @@
 // ============================================================
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useLocation, useNavigate } from "react-router-dom";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import remarkBreaks from "remark-breaks";
+import rehypeSanitize from "rehype-sanitize";
 import { socket } from "../socket";
 import {
   MdSend,
@@ -58,6 +62,96 @@ const DESERT_ITEMS = [
   "A book - 'Edible Animals of the Desert'"
 ];
 
+const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:5000";
+
+const MARKDOWN_COMPONENTS = {
+  p: ({ children, ...rest }) => (
+    <p className="mb-2 last:mb-0 text-sm leading-relaxed" {...rest}>
+      {children}
+    </p>
+  ),
+  strong: ({ children, ...rest }) => (
+    <strong className="font-semibold" {...rest}>
+      {children}
+    </strong>
+  ),
+  em: ({ children, ...rest }) => (
+    <em className="italic" {...rest}>
+      {children}
+    </em>
+  ),
+  ul: ({ children, ...rest }) => (
+    <ul className="list-disc pl-5 space-y-1 mb-2 text-sm" {...rest}>
+      {children}
+    </ul>
+  ),
+  ol: ({ children, ...rest }) => (
+    <ol className="list-decimal pl-5 space-y-1 mb-2 text-sm" {...rest}>
+      {children}
+    </ol>
+  ),
+  li: ({ children, ...rest }) => (
+    <li className="leading-relaxed" {...rest}>
+      {children}
+    </li>
+  ),
+  h1: ({ children, ...rest }) => (
+    <h1 className="text-lg font-bold mb-2" {...rest}>
+      {children}
+    </h1>
+  ),
+  h2: ({ children, ...rest }) => (
+    <h2 className="text-base font-bold mb-2" {...rest}>
+      {children}
+    </h2>
+  ),
+  h3: ({ children, ...rest }) => (
+    <h3 className="text-sm font-bold mb-1" {...rest}>
+      {children}
+    </h3>
+  ),
+  code: ({ children, ...rest }) => (
+    <code className="bg-black/10 rounded px-1 text-xs font-mono" {...rest}>
+      {children}
+    </code>
+  ),
+};
+
+function ChatMessageBody({ msg, isCurrentUser }) {
+  const isHtml =
+    msg.content_format === "html" ||
+    msg.message_type === "task" ||
+    (typeof msg.message === "string" && msg.message.includes('class="task-intro"'));
+
+  if (isHtml && typeof msg.message === "string") {
+    return (
+      <div
+        className="task-message-html max-w-none text-left [&_a]:text-indigo-600"
+        dangerouslySetInnerHTML={{ __html: msg.message }}
+      />
+    );
+  }
+
+  const isModeratorOrSystem = msg.sender === "Moderator" || msg.sender === "System";
+  if (isModeratorOrSystem && typeof msg.message === "string" && /[*_`#[\]|]/.test(msg.message)) {
+    return (
+      <div className={`max-w-none text-left ${isCurrentUser ? "text-white" : ""}`}>
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm, remarkBreaks]}
+          rehypePlugins={[rehypeSanitize]}
+          components={MARKDOWN_COMPONENTS}
+        >
+          {msg.message}
+        </ReactMarkdown>
+      </div>
+    );
+  }
+
+  return (
+    <p className="whitespace-pre-wrap break-words text-sm">{msg.message}</p>
+  );
+}
+
 // ============================================================
 // 🎯 MAIN CHATROOM COMPONENT
 // ============================================================
@@ -90,8 +184,28 @@ export default function ChatRoom() {
   const [draggedItem, setDraggedItem] = useState(null);
   const [languageWarning, setLanguageWarning] = useState(null);
   const languageWarningTimerRef = useRef(null);
+  const processedIdsRef = useRef(new Set());
+  const [showItemsPanel, setShowItemsPanel] = useState(true);
+  const [desertItems, setDesertItems] = useState(() => [...DESERT_ITEMS]);
 
   const messagesEndRef = useRef(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${API_BASE}/api/desert-items`)
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error(res.statusText))))
+      .then((data) => {
+        if (!cancelled && Array.isArray(data.items) && data.items.length > 0) {
+          setDesertItems(data.items);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setDesertItems([...DESERT_ITEMS]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const dismissLanguageWarning = useCallback(() => {
     if (languageWarningTimerRef.current) {
@@ -169,7 +283,13 @@ export default function ChatRoom() {
     });
 
     socket.on("chat_history", (data) => {
-      setMessages(data.chat_history || []);
+      const list = data.chat_history || [];
+      processedIdsRef.current = new Set();
+      for (const m of list) {
+        const mid = m.id != null ? String(m.id) : `${m.sender}|${m.message}|${m.timestamp}`;
+        processedIdsRef.current.add(mid);
+      }
+      setMessages(list);
       if (data.participants) {
         setParticipants(data.participants);
       } else {
@@ -181,32 +301,56 @@ export default function ChatRoom() {
       console.log("📨 RECEIVED MESSAGE:", data);
 
       setMessages((prev) => {
-        const dupIndex = prev.findIndex(
-          (msg) =>
-            msg.sender === data.sender &&
-            msg.message === data.message &&
-            Math.abs(new Date(msg.timestamp || 0) - new Date(data.timestamp || 0)) < 4000
-        );
+        const mid =
+          data.id != null
+            ? String(data.id)
+            : `${data.sender}|${data.message}|${data.timestamp || ""}`;
 
-        if (dupIndex >= 0) {
+        const optIdx = prev.findIndex(
+          (msg) =>
+            msg._optimistic &&
+            msg.sender === data.sender &&
+            msg.message === data.message
+        );
+        if (optIdx >= 0) {
+          if (processedIdsRef.current.has(mid)) return prev;
+          processedIdsRef.current.add(mid);
+          const next = [...prev];
+          next[optIdx] = {
+            ...data,
+            timestamp: data.timestamp || next[optIdx].timestamp,
+          };
+          return next;
+        }
+
+        if (processedIdsRef.current.has(mid)) {
           if (data.flagged) {
-            const next = [...prev];
-            next[dupIndex] = {
-              ...next[dupIndex],
-              ...data,
-              timestamp: next[dupIndex].timestamp || data.timestamp,
-            };
-            return next;
+            const idx = prev.findIndex(
+              (msg) =>
+                String(msg.id) === mid ||
+                (msg.sender === data.sender && msg.message === data.message)
+            );
+            if (idx >= 0) {
+              const next = [...prev];
+              next[idx] = { ...next[idx], ...data };
+              return next;
+            }
           }
-          console.log("⚠️ Duplicate message ignored");
+          console.log("⚠️ Duplicate message ignored:", mid);
           return prev;
+        }
+
+        processedIdsRef.current.add(mid);
+        if (processedIdsRef.current.size > 800) {
+          processedIdsRef.current = new Set(
+            Array.from(processedIdsRef.current).slice(-400)
+          );
         }
 
         const newMessage = {
           ...data,
           timestamp: data.timestamp || new Date().toISOString(),
         };
-
         return [...prev, newMessage];
       });
     });
@@ -235,13 +379,15 @@ export default function ChatRoom() {
       if (data.success) {
         setRankingSubmitted(true);
         setShowRankingModal(false);
-        // Show success message in chat
+        const successId = `local-ranking-ok-${Date.now()}`;
+        processedIdsRef.current.add(successId);
         const successMsg = {
+          id: successId,
           sender: "System",
           message: "✅ Final ranking submitted successfully!",
-          timestamp: new Date().toISOString()
+          timestamp: new Date().toISOString(),
         };
-        setMessages(prev => [...prev, successMsg]);
+        setMessages((prev) => [...prev, successMsg]);
       } else {
         alert("❌ Failed to submit ranking: " + data.message);
       }
@@ -301,11 +447,17 @@ export default function ChatRoom() {
 
     sendSound.play().catch(() => {});
 
-    setMessages(prev => [...prev, { 
-      sender: userName, 
-      message: trimmed, 
-      timestamp: new Date().toISOString() 
-    }]);
+    const tempId = `temp:${userName}:${Date.now()}`;
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: tempId,
+        _optimistic: true,
+        sender: userName,
+        message: trimmed,
+        timestamp: new Date().toISOString(),
+      },
+    ]);
 
     socket.emit("send_message", {
       room_id: roomId,
@@ -559,10 +711,65 @@ export default function ChatRoom() {
       </div>
 
       {/* 📱 MAIN CONTENT */}
-      <div className="flex flex-1 overflow-hidden">
-        
+      <div className="flex flex-1 overflow-hidden relative">
+        {/* Persistent desert items + draft ranking */}
+        <div
+          className={`fixed left-0 top-20 bottom-0 w-80 max-w-[85vw] bg-white border-r border-gray-200 shadow-lg z-40 flex flex-col transition-transform duration-300 ${
+            showItemsPanel ? "translate-x-0" : "-translate-x-full"
+          }`}
+        >
+          <div className="p-4 border-b border-gray-100 flex items-center justify-between gap-2">
+            <h3 className="font-bold text-gray-800 text-sm">Desert survival items</h3>
+            <button
+              type="button"
+              onClick={() => setShowItemsPanel(false)}
+              className="text-gray-400 hover:text-gray-600 text-lg leading-none px-1"
+              aria-label="Hide items panel"
+            >
+              ×
+            </button>
+          </div>
+          <div className="flex-1 overflow-y-auto p-4 space-y-2">
+            {desertItems.map((item, idx) => (
+              <div key={`${idx}-${item}`} className="p-2 bg-gray-50 rounded-lg text-sm text-gray-800">
+                <span className="font-medium text-indigo-600">{idx + 1}.</span> {item}
+              </div>
+            ))}
+          </div>
+          <div className="p-4 border-t border-gray-100 bg-amber-50/50">
+            <p className="text-xs font-semibold text-amber-900 mb-2">Your group ranking (draft)</p>
+            {ranking.length === 12 ? (
+              <ol className="text-xs text-gray-700 space-y-1 list-decimal pl-4 max-h-40 overflow-y-auto">
+                {ranking.map((item, i) => (
+                  <li key={`r-${i}`}>{item}</li>
+                ))}
+              </ol>
+            ) : (
+              <p className="text-xs text-gray-600">
+                Open the ranking modal when it appears, then drag items into your agreed order. The list here
+                updates as you reorder.
+              </p>
+            )}
+          </div>
+        </div>
+
+        {!showItemsPanel && (
+          <button
+            type="button"
+            onClick={() => setShowItemsPanel(true)}
+            className="fixed left-0 top-1/2 -translate-y-1/2 bg-indigo-600 text-white py-3 px-2 rounded-r-lg shadow-lg z-40 hover:bg-indigo-700 text-sm"
+            aria-label="Show desert items"
+          >
+            Items
+          </button>
+        )}
+
         {/* 💬 CHAT MESSAGES */}
-        <div className="flex-1 flex flex-col overflow-hidden">
+        <div
+          className={`flex-1 flex flex-col overflow-hidden min-w-0 transition-[margin] duration-300 ${
+            showItemsPanel ? "ml-80" : "ml-0"
+          }`}
+        >
           
           {/* Messages Container */}
           <div className="flex-1 overflow-y-auto p-4 space-y-4">
@@ -596,7 +803,7 @@ export default function ChatRoom() {
 
                 return (
                   <div
-                    key={`${msg.sender}-${index}-${msg.message.substring(0, 10)}`}
+                    key={msg.id || `${msg.sender}-${index}-${String(msg.message).slice(0, 24)}`}
                     className={`flex items-start gap-3 ${isCurrentUser ? 'flex-row-reverse' : ''}`}
                   >
                     {/* Avatar */}
@@ -656,9 +863,7 @@ export default function ChatRoom() {
                             Flagged for review
                           </p>
                         )}
-                        <p className="whitespace-pre-wrap break-words text-sm">
-                          {msg.message}
-                        </p>
+                        <ChatMessageBody msg={msg} isCurrentUser={isCurrentUser} />
                       </div>
                     </div>
                   </div>

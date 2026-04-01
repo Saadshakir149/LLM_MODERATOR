@@ -82,6 +82,7 @@ from supabase_client import (
 # ============================================================
 from research_metrics import (
     calculate_gini_coefficient,
+    calculate_entropy,
     analyze_participation,
     detect_conflict_episodes,
 )
@@ -92,9 +93,9 @@ from research_metrics import (
 from data_retriever import (
     get_data,
     format_story_block,
-    get_story_intro,
+    get_story_intro_html,
     get_task_items,
-    compare_with_expert_ranking
+    compare_with_expert_ranking,
 )
 
 # ============================================================
@@ -183,9 +184,23 @@ def handle_connect():
 def handle_connect_error(error):
     logger.error(f"❌ SOCKET CONNECT ERROR: {error}")
 
-@socketio.on('disconnect')
+@socketio.on("disconnect")
 def handle_disconnect():
-    logger.info(f"🔌 SOCKET DISCONNECTED: {request.sid}")
+    """Clear socket_id on disconnect so we do not target dead connections; swallow teardown errors."""
+    sid = getattr(request, "sid", None) or ""
+    try:
+        logger.info(f"🔌 Client disconnected: {sid}")
+        participant = get_participant_by_socket(sid) if sid else None
+        if participant and participant.get("id"):
+            supabase.table("participants").update(
+                {
+                    "socket_id": None,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            ).eq("id", participant["id"]).execute()
+    except Exception as e:
+        # Avoid noisy tracebacks during WSGI/socket teardown (e.g. write before start_response).
+        logger.debug(f"Disconnect cleanup (non-critical): {e}")
 # Add after your socketio initialization
 @socketio.on('ping')
 def handle_ping(data):
@@ -204,6 +219,85 @@ def add_keep_alive_headers(response):
 active_monitors: Dict[str, threading.Thread] = {}
 room_sessions: Dict[str, str] = {}  # room_id -> session_id
 research_timers: Dict[str, threading.Thread] = {}  # room_id -> timer thread
+room_last_expert_tip: Dict[str, float] = {}
+room_expert_tip_message_key: Dict[str, str] = {}
+
+
+def chat_socket_payload(sender: str, message: str, **extra: Any) -> dict:
+    """Stable chat event payload with id (dedup on client)."""
+    payload: dict = {
+        "id": extra.pop("id", None) or str(uuid.uuid4()),
+        "sender": sender,
+        "message": message,
+        "timestamp": datetime.now().isoformat(),
+    }
+    payload.update(extra)
+    return payload
+
+
+def get_expert_ranking_opinion(item_label: str) -> Optional[str]:
+    """Short expert-style survival perspective for a scenario item (neutral, educational)."""
+    low = item_label.lower()
+    if "water" in low or "quart" in low:
+        return (
+            "💧 Water is usually the highest priority in desert heat — even mild dehydration "
+            "impairs judgment quickly."
+        )
+    if "mirror" in low or "cosmetic" in low:
+        return (
+            "🪞 A mirror is an excellent lightweight signal for aircraft; many expert rankings "
+            "place it very high for rescue visibility."
+        )
+    if "flashlight" in low or "battery" in low:
+        return (
+            "🔦 Flashlights help at night for signaling and camp tasks, but batteries are finite — "
+            "compare that to passive signaling tools."
+        )
+    if "plastic" in low or "sheet" in low:
+        return (
+            "🟠 A large plastic sheet can provide shade, collect dew/rain, and improve visibility "
+            "depending on color."
+        )
+    if "match" in low:
+        return (
+            "🔥 Matches are useful if you have fuel and fire safety; in dry desert conditions "
+            "their value depends on what you can burn."
+        )
+    if "coat" in low or "winter" in low:
+        return (
+            "🧥 A coat matters for cold desert nights when temperatures can drop sharply after sunset."
+        )
+    if "salt" in low or "tablet" in low:
+        return (
+            "🧂 Salt tablets without enough water can worsen dehydration — experts often rank them "
+            "lower unless water is abundant."
+        )
+    if "knife" in low:
+        return (
+            "🔪 A knife is versatile for gear repair, shelter, and first aid; usefulness is high "
+            "but not always above water and rescue signaling."
+        )
+    if "parachute" in low:
+        return (
+            "🪂 Parachute fabric can be shelter or signal material; expert lists vary based on "
+            "whether rescue or self-extraction is the plan."
+        )
+    if "book" in low or "edible" in low:
+        return (
+            "📖 Field guides look helpful, but misidentifying plants is dangerous — many expert "
+            "rankings place this lower than water, signaling, and shelter."
+        )
+    if "compass" in low:
+        return (
+            "🧭 A compass mainly helps if the group chooses to move; staying put is often safer "
+            "when lost and awaiting rescue."
+        )
+    if "map" in low:
+        return (
+            "🗺️ Like a compass, a map helps navigation — value drops if the plan is to stay in place "
+            "and signal rescuers."
+        )
+    return None
 
 # ============================================================
 # Groq Client Setup
@@ -443,7 +537,7 @@ def start_research_timer(room_id: str):
             
             socketio.emit(
                 "receive_message",
-                {"sender": "Moderator", "message": warning_msg},
+                chat_socket_payload("Moderator", warning_msg),
                 room=room_id,
             )
             
@@ -461,7 +555,7 @@ def start_research_timer(room_id: str):
             
             socketio.emit(
                 "receive_message",
-                {"sender": "Moderator", "message": final_warning},
+                chat_socket_payload("Moderator", final_warning),
                 room=room_id,
             )
             
@@ -524,19 +618,25 @@ def start_task_for_room(room_id: str):
         # Send task intro
         task_data = get_room_task_data(room_id)
         if task_data:
-            intro = get_story_intro(task_data)
-            logger.info(f"📋 Sending task intro to room {room_id}")
+            intro = get_story_intro_html(task_data)
+            logger.info(f"📋 Sending task intro (HTML) to room {room_id}")
 
             add_message(
                 room_id=room_id,
                 username="Moderator",
                 message=intro,
-                message_type="task"
+                message_type="task",
+                metadata={"content_format": "html", "kind": "task_intro"},
             )
 
             socketio.emit(
                 "receive_message",
-                {"sender": "Moderator", "message": intro},
+                chat_socket_payload(
+                    "Moderator",
+                    intro,
+                    content_format="html",
+                    message_type="task",
+                ),
                 room=room_id,
             )
 
@@ -656,9 +756,11 @@ def start_active_moderator(room_id: str):
                                     response = f"{dominant_user}, good points. {others[0]}, what do you think about this?"
                             
                             add_message(room_id, "Moderator", response, "moderator")
-                            socketio.emit("receive_message", 
-                                        {"sender": "Moderator", "message": response},
-                                        room=room_id)
+                            socketio.emit(
+                                "receive_message",
+                                chat_socket_payload("Moderator", response),
+                                room=room_id,
+                            )
                             
                             # Log intervention for research
                             log_moderator_intervention(room_id, "balance_dominance", dominant_user)
@@ -700,9 +802,11 @@ def start_active_moderator(room_id: str):
                             response = f"{silent_user}, we haven't heard from you yet. What do you think about the desert survival items? Which one would you prioritize?"
                         
                         add_message(room_id, "Moderator", response, "moderator")
-                        socketio.emit("receive_message",
-                                    {"sender": "Moderator", "message": response},
-                                    room=room_id)
+                        socketio.emit(
+                            "receive_message",
+                            chat_socket_payload("Moderator", response),
+                            room=room_id,
+                        )
                         
                         log_moderator_intervention(room_id, "invite_silent", silent_user)
                         invited_users.add(silent_user)
@@ -730,9 +834,11 @@ def start_active_moderator(room_id: str):
                         response = f"⚠️ We have {time_remaining} minutes remaining. Can you agree on your top 3 most important items?"
                     
                     add_message(room_id, "Moderator", response, "moderator")
-                    socketio.emit("receive_message",
-                                {"sender": "Moderator", "message": response},
-                                room=room_id)
+                    socketio.emit(
+                        "receive_message",
+                        chat_socket_payload("Moderator", response),
+                        room=room_id,
+                    )
                     
                     log_moderator_intervention(room_id, "time_warning", None)
                     last_intervention_time = now
@@ -782,9 +888,11 @@ def start_active_moderator(room_id: str):
                             # Only send if we got a valid response (not fallback)
                             if response and len(response) > 10 and "Thanks for sharing" not in response:
                                 add_message(room_id, "Moderator", response, "moderator")
-                                socketio.emit("receive_message", 
-                                            {"sender": "Moderator", "message": response},
-                                            room=room_id)
+                                socketio.emit(
+                                    "receive_message",
+                                    chat_socket_payload("Moderator", response),
+                                    room=room_id,
+                                )
                                 
                                 log_moderator_intervention(room_id, "answered_question", last_msg.get('username'))
                                 last_intervention_time = now
@@ -800,13 +908,60 @@ def start_active_moderator(room_id: str):
                                     fallback = "You need to rank the 12 items from most important (1) to least important (12) for desert survival. Discuss with your group and reach consensus."
                                 
                                 add_message(room_id, "Moderator", fallback, "moderator")
-                                socketio.emit("receive_message", 
-                                            {"sender": "Moderator", "message": fallback},
-                                            room=room_id)
+                                socketio.emit(
+                                    "receive_message",
+                                    chat_socket_payload("Moderator", fallback),
+                                    room=room_id,
+                                )
                                 
                                 log_moderator_intervention(room_id, "answered_question_fallback", last_msg.get('username'))
                                 last_intervention_time = now
                                 logger.info(f"✅ Sent fallback answer to {last_msg.get('username')}")
+                
+                # RULE 4.5: Occasional expert survival perspective when a specific item is discussed
+                if messages and len(messages) > 0:
+                    tip_msg = messages[-1]
+                    if tip_msg.get("username") != "Moderator":
+                        raw_tip = tip_msg.get("message", "")
+                        low_tip = raw_tip.lower()
+                        tip_fingerprint = (
+                            f"{tip_msg.get('username')}|{tip_msg.get('created_at', '')}|{raw_tip[:160]}"
+                        )
+                        if room_expert_tip_message_key.get(room_id) != tip_fingerprint:
+                            for item_label in get_task_items():
+                                il = item_label.lower()
+                                if len(il) >= 6 and il in low_tip:
+                                    room_expert_tip_message_key[room_id] = tip_fingerprint
+                                    opinion = get_expert_ranking_opinion(item_label)
+                                    if opinion and (
+                                        now - room_last_expert_tip.get(room_id, 0) > 90
+                                    ) and (now - last_intervention_time > 50):
+                                        response = (
+                                            f"📚 Expert perspective on “{item_label}”: {opinion}\n\n"
+                                            "How does that fit with your group's ranking so far?"
+                                        )
+                                        add_message(
+                                            room_id,
+                                            "Moderator",
+                                            response,
+                                            "moderator",
+                                        )
+                                        socketio.emit(
+                                            "receive_message",
+                                            chat_socket_payload("Moderator", response),
+                                            room=room_id,
+                                        )
+                                        log_moderator_intervention(
+                                            room_id,
+                                            "expert_item_hint",
+                                            tip_msg.get("username"),
+                                        )
+                                        room_last_expert_tip[room_id] = now
+                                        last_intervention_time = now
+                                        logger.info(
+                                            f"📚 Expert hint for item: {item_label[:50]}"
+                                        )
+                                    break
                 
                 # RULE 5: Periodic summaries (every 5 minutes)
                 if time_elapsed > 0 and time_elapsed % 5 == 0 and now - last_intervention_time > 60:
@@ -827,9 +982,11 @@ def start_active_moderator(room_id: str):
                         response = f"📊 {time_elapsed} minutes have passed. You've sent {msg_count} messages. Keep discussing to reach consensus on the item ranking."
                     
                     add_message(room_id, "Moderator", response, "moderator")
-                    socketio.emit("receive_message",
-                                {"sender": "Moderator", "message": response},
-                                room=room_id)
+                    socketio.emit(
+                        "receive_message",
+                        chat_socket_payload("Moderator", response),
+                        room=room_id,
+                    )
                     
                     log_moderator_intervention(room_id, "summary", None)
                     last_intervention_time = now
@@ -944,9 +1101,11 @@ def start_passive_moderator(room_id: str):
                                     response = "I'm observing the discussion. Continue with your task."
                             
                             add_message(room_id, "Moderator", response, "moderator")
-                            socketio.emit("receive_message",
-                                        {"sender": "Moderator", "message": response},
-                                        room=room_id)
+                            socketio.emit(
+                                "receive_message",
+                                chat_socket_payload("Moderator", response),
+                                room=room_id,
+                            )
                             
                             log_moderator_intervention(room_id, "responded_to_question", last_msg.get('username'))
                             last_response_time = now
@@ -964,7 +1123,7 @@ def start_passive_moderator(room_id: str):
                     
                     socketio.emit(
                         "receive_message",
-                        {"sender": "Moderator", "message": warning_msg},
+                        chat_socket_payload("Moderator", warning_msg),
                         room=room_id,
                     )
                     
@@ -1184,6 +1343,14 @@ def get_room_info(room_id: str):
         logger.error(f"❌ Error getting room info: {e}", exc_info=True)
         return jsonify({"error": "Failed to get room info"}), 500
 
+
+@app.route("/api/desert-items")
+def get_desert_items_api():
+    """Desert survival item list for the persistent chat sidebar."""
+    items = get_task_items()
+    return jsonify({"items": items, "count": len(items)})
+
+
 # ============================================================
 # Socket.IO Events — room lifecycle & messaging
 # (connect/disconnect registered near socketio initialization)
@@ -1229,7 +1396,7 @@ def create_room_handler(data):
                 )
                 socketio.emit(
                     "receive_message",
-                    {"sender": "Moderator", "message": WELCOME_MESSAGE},
+                    chat_socket_payload("Moderator", WELCOME_MESSAGE),
                     room=room_id,
                 )
             except Exception as wel_exc:
@@ -1303,12 +1470,18 @@ def join_room_handler(data):
             ):
                 continue
             entry = {
+                "id": str(msg["id"]) if msg.get("id") is not None else None,
                 "sender": msg["username"],
                 "message": msg["message"],
                 "timestamp": msg["created_at"],
+                "message_type": mtype,
             }
             if meta.get("flagged"):
                 entry["flagged"] = True
+            if meta.get("content_format"):
+                entry["content_format"] = meta["content_format"]
+            if meta.get("flag_reason"):
+                entry["flag_reason"] = meta["flag_reason"]
             chat_history.append(entry)
 
         # Get current participants (deduplicated)
@@ -1402,35 +1575,35 @@ def send_message_handler(data):
 
             log_moderator_intervention(room_id, "language_warning", sender)
 
-            add_message(
+            saved_row = add_message(
                 room_id=room_id,
                 username=sender,
                 message=msg,
-                message_type="chat",
+                message_type="chat_flagged",
                 metadata={
                     "word_count": word_count,
                     "flagged": True,
                     "bad_words": bad_words,
                     "severity": severity,
+                    "flag_reason": "inappropriate language",
                 },
             )
 
             emit(
                 "receive_message",
-                {
-                    "id": f"{room_id}_{sender}_{int(time.time() * 1000)}",
-                    "sender": sender,
-                    "message": msg,
-                    "timestamp": datetime.now().isoformat(),
-                    "flagged": True,
-                    "flag_reason": "inappropriate language",
-                },
+                chat_socket_payload(
+                    sender,
+                    msg,
+                    id=str(saved_row.get("id", f"{room_id}_{sender}_{int(time.time() * 1000)}")),
+                    flagged=True,
+                    flag_reason="inappropriate language",
+                ),
                 room=room_id,
             )
             logger.info(f"✅ Flagged message from {sender} broadcast (severity={severity})")
             return
 
-        add_message(
+        saved_chat = add_message(
             room_id=room_id,
             username=sender,
             message=msg,
@@ -1440,7 +1613,11 @@ def send_message_handler(data):
 
         emit(
             "receive_message",
-            {"sender": sender, "message": msg, "timestamp": datetime.now().isoformat()},
+            chat_socket_payload(
+                sender,
+                msg,
+                id=str(saved_chat.get("id", f"{room_id}_{sender}_{int(time.time() * 1000)}")),
+            ),
             room=room_id,
         )
 
@@ -1483,49 +1660,68 @@ def handle_end_session(data):
         participants = get_participants(room_id)
         full_chat_history = get_chat_history(room_id)
         
-        # Filter out moderator messages for participant analysis
-        participant_messages = [m for m in full_chat_history if m.get('username') != 'Moderator']
+        _non_participant = {"Moderator", "System"}
+        participant_messages = [
+            m for m in full_chat_history if m.get("username") not in _non_participant
+        ]
         
         # ===== 3. CALCULATE RESEARCH METRICS =====
-        
-        # Message counts per participant
-        message_counts = {}
-        word_counts = {}
+        # Include every enrolled student (0 messages if silent) for RQ1/RQ3 inclusion metrics.
+        student_usernames = [
+            p.get("username")
+            for p in participants
+            if p.get("username") and p.get("username") not in _non_participant
+        ]
+        message_counts = {u: 0 for u in student_usernames}
+        word_counts = {u: 0 for u in student_usernames}
         for msg in participant_messages:
-            username = msg.get('username')
+            username = msg.get("username")
+            if username not in message_counts:
+                message_counts[username] = 0
+                word_counts[username] = 0
             message_counts[username] = message_counts.get(username, 0) + 1
-            word_count = len(msg.get('message', '').split())
-            word_counts[username] = word_counts.get(username, 0) + word_count
+            wc = len(msg.get("message", "").split())
+            word_counts[username] = word_counts.get(username, 0) + wc
         
-        # Calculate total messages and shares
         total_messages = sum(message_counts.values())
         total_words = sum(word_counts.values())
         
-        # Calculate speaking shares
         speaking_shares = {}
         if total_messages > 0:
             for user, count in message_counts.items():
                 speaking_shares[user] = count / total_messages
+        else:
+            for user in message_counts:
+                speaking_shares[user] = 0.0
         
-        # Calculate Gini coefficient
+        # Gini over speaking shares (including zeros for silent members)
         gini_coefficient = 0
-        if len(message_counts) >= 3:  # Need at least 3 participants
-            shares = list(speaking_shares.values())
-            sorted_shares = sorted(shares)
+        share_list = [speaking_shares[u] for u in sorted(speaking_shares.keys())]
+        if len(share_list) >= 2:
+            sorted_shares = sorted(share_list)
             n = len(sorted_shares)
-            cumulative = 0
-            gini = 0
+            gini = 0.0
             for i, share in enumerate(sorted_shares):
-                cumulative += share
-                gini += (2*i - n + 1) * share
+                gini += (2 * i - n + 1) * share
             if sum(sorted_shares) > 0:
                 gini_coefficient = gini / (n * sum(sorted_shares))
             gini_coefficient = max(0, min(gini_coefficient, 1))
         
-        # Calculate dominance metrics
+        participation_entropy = calculate_entropy(share_list) if share_list else 0.0
+        
         max_share = max(speaking_shares.values()) if speaking_shares else 0
         min_share = min(speaking_shares.values()) if speaking_shares else 0
         dominance_gap = max_share - min_share
+        
+        conflict_report = detect_conflict_episodes(room_id, full_chat_history)
+        repair_times = [
+            float(r["time_to_repair"])
+            for r in conflict_report.get("repairs", [])
+            if r.get("time_to_repair") is not None
+        ]
+        mean_time_to_repair = (
+            sum(repair_times) / len(repair_times) if repair_times else None
+        )
         
         # Calculate time to consensus (if ranking was submitted)
         time_to_consensus = None
@@ -1542,14 +1738,22 @@ def handle_end_session(data):
             # Save room-level metrics
             metrics_data = {
                 "room_id": room_id,
+                "condition": room.get("mode"),
                 "gini_coefficient": gini_coefficient,
+                "participation_entropy": participation_entropy,
                 "max_share": max_share,
                 "min_share": min_share,
                 "dominance_gap": dominance_gap,
                 "total_messages": total_messages,
                 "total_words": total_words,
-                "created_at": datetime.now(timezone.utc).isoformat()
+                "conflict_count": conflict_report.get("conflict_count", 0),
+                "repair_count": conflict_report.get("repair_count", 0),
+                "repair_rate": conflict_report.get("repair_rate", 0.0),
+                "ranking_submitted": bool(room.get("final_ranking")),
+                "created_at": datetime.now(timezone.utc).isoformat(),
             }
+            if mean_time_to_repair is not None:
+                metrics_data["mean_time_to_repair_seconds"] = mean_time_to_repair
             
             # Add ranking accuracy if available
             if room.get('final_ranking'):
@@ -1565,19 +1769,34 @@ def handle_end_session(data):
             supabase.table("research_metrics").insert(metrics_data).execute()
             logger.info(f"📊 Saved research metrics for room {room_id}")
             
-            # Save individual participant metrics
-            for user in message_counts.keys():
+            metric_users = sorted(message_counts.keys())
+            for user in metric_users:
                 participant_data = {
                     "room_id": room_id,
                     "username": user,
                     "message_count": message_counts.get(user, 0),
                     "word_count": word_counts.get(user, 0),
                     "share_of_talk": speaking_shares.get(user, 0),
-                    "created_at": datetime.now(timezone.utc).isoformat()
+                    "created_at": datetime.now(timezone.utc).isoformat(),
                 }
                 supabase.table("participant_metrics").insert(participant_data).execute()
-            
-            logger.info(f"👥 Saved participant metrics for {len(message_counts)} users")
+
+            if not metric_users:
+                logger.info(
+                    f"ℹ️ No enrolled participants in room {room_id} — skipping participant_metrics rows"
+                )
+            elif total_messages == 0:
+                logger.info(
+                    f"ℹ️ Room {room_id}: saved participant_metrics for {len(metric_users)} users "
+                    f"(0 chat messages; shares and Gini reflect silence)"
+                )
+            else:
+                logger.info(f"👥 Saved participant metrics for {len(metric_users)} users")
+
+            try:
+                analyze_conflict_episodes(room_id)
+            except Exception as ex:
+                logger.debug(f"Optional conflict_episodes persistence skipped: {ex}")
             
         except Exception as e:
             logger.error(f"❌ Failed to save research metrics: {e}")
@@ -1587,9 +1806,38 @@ def handle_end_session(data):
             {"sender": msg['username'], "message": msg['message']}
             for msg in full_chat_history
         ]
-        
+
+        def _row_meta(row: dict) -> dict:
+            meta = row.get("metadata")
+            if isinstance(meta, str):
+                try:
+                    return json.loads(meta) or {}
+                except Exception:
+                    return {}
+            return meta or {}
+
+        all_participants_data: List[dict] = []
+        for participant in participants:
+            un = participant.get("username")
+            if un in ("Moderator", "System"):
+                continue
+            flagged_n = sum(
+                1
+                for m in participant_messages
+                if m.get("username") == un and _row_meta(m).get("flagged")
+            )
+            all_participants_data.append(
+                {
+                    "name": participant.get("display_name", un),
+                    "message_count": message_counts.get(un, 0),
+                    "word_count": word_counts.get(un, 0),
+                    "share_of_talk": speaking_shares.get(un, 0) * 100,
+                    "toxic_count": flagged_n,
+                }
+            )
+
         feedbacks = {}
-        
+
         for participant in participants:
             username = participant.get('username')
             display_name = participant.get('display_name', username)
@@ -1641,6 +1889,7 @@ def handle_end_session(data):
                         chat_history=chat_history_list,
                         story_context=task_context,
                         chat_sender_name=username,
+                        all_participants_data=all_participants_data,
                     )
                     if feedback and len(feedback.strip()) > 100:
                         logger.info(f"✅ Quality feedback for {username} (attempt {attempt + 1})")

@@ -3,6 +3,8 @@
 # ============================================================
 from __future__ import annotations
 import os
+import re
+import html
 import json
 import logging
 import random
@@ -200,30 +202,88 @@ def get_data(story_id: Optional[str] = None) -> Dict[str, Any]:
 # ============================================================
 # 🪄 Generate Task Introduction
 # ============================================================
+def _description_to_markdown_body(description: str) -> str:
+    """Turn scenario **bold** segments into readable markdown (no stray asterisks)."""
+    if not description:
+        return ""
+    out: list[str] = []
+    for segment in re.split(r"(\*\*.+?\*\*)", description, flags=re.DOTALL):
+        if segment.startswith("**") and segment.endswith("**") and len(segment) > 4:
+            inner = segment[2:-2].strip()
+            out.append(f"**{inner}**")
+        else:
+            out.append(segment.strip())
+    return "\n\n".join(s for s in out if s)
+
+
 def get_story_intro(task_data: dict) -> str:
-    """Generate introduction text for the desert survival scenario"""
+    """Markdown task introduction for clients that render markdown (headings + lists)."""
     task_name = task_data.get("task_name", "Desert Survival")
     description = task_data.get("description", "").strip()
-    
-    # Format items list for display
+    body = _description_to_markdown_body(description)
     items = task_data.get("items", [])
-    items_text = "\n".join([f"• {item}" for item in items])
-    
-    return f"""
-**{task_name}**
+    items_md = "\n".join(f"- {item}" for item in items)
 
-{description}
+    return f"""### {task_name}
 
-**Items to rank:**
-{items_text}
+#### Background
 
-**Your task:**
-1. Rank the items from 1 (most important for survival) to 12 (least important)
-2. Agree on one final group ranking
-3. Be prepared to briefly explain your reasoning
+{body}
 
-You have 15 minutes to reach consensus.
+#### Items in your packs
+
+You check your supplies and find:
+
+{items_md}
+
+#### Your task
+
+1. Rank the items from **1** (most important for survival) to **12** (least important).
+2. Agree on **one** final group ranking.
+3. Be ready to briefly explain your reasoning.
+
+⏰ **You have 15 minutes** to reach consensus.
 """
+
+
+def _description_to_safe_html(description: str) -> str:
+    """Convert **bold** in scenario text to <strong>; escape the rest."""
+    if not description:
+        return ""
+    parts: list[str] = []
+    for segment in re.split(r"(\*\*.+?\*\*)", description, flags=re.DOTALL):
+        if segment.startswith("**") and segment.endswith("**") and len(segment) > 4:
+            inner = html.escape(segment[2:-2].strip())
+            parts.append(f'<strong class="font-semibold text-gray-800">{inner}</strong>')
+        else:
+            parts.append(html.escape(segment).replace("\n", "<br />\n"))
+    return "".join(parts)
+
+
+def get_story_intro_html(task_data: dict) -> str:
+    """Sanitized HTML task card for chat (renders with trusted server-only markup)."""
+    task_name = html.escape(task_data.get("task_name", "Desert Survival"))
+    desc_html = _description_to_safe_html(task_data.get("description", "").strip())
+    items = task_data.get("items", [])
+    items_html = "".join(
+        f'<li class="mb-2 text-gray-700">{html.escape(item)}</li>' for item in items
+    )
+
+    return f"""<div class="task-intro text-left">
+  <h3 class="text-lg font-bold text-indigo-800 mb-3">{task_name}</h3>
+  <div class="mb-3 text-sm leading-relaxed text-gray-700">{desc_html}</div>
+  <h4 class="font-semibold text-gray-800 mb-2 text-sm">Items in your packs</h4>
+  <ul class="list-disc pl-5 space-y-1 text-sm mb-3">{items_html}</ul>
+  <div class="mt-2 p-3 bg-amber-50 rounded-lg border border-amber-200 text-sm">
+    <p class="font-semibold text-amber-900 mb-2">Your task</p>
+    <ol class="list-decimal pl-5 space-y-1 text-gray-800">
+      <li>Rank items 1 (most important)–12 (least important).</li>
+      <li>Agree on one final group ranking.</li>
+      <li>Be ready to explain your reasoning briefly.</li>
+    </ol>
+    <p class="text-amber-800 mt-2 font-medium">⏰ 15 minutes to reach consensus.</p>
+  </div>
+</div>"""
 
 # ============================================================
 # 🧱 Format Task Block (for display/debug)

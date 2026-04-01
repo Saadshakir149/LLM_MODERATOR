@@ -734,7 +734,13 @@ def get_room_stats(room_id: str) -> Dict[str, Any]:
         messages = messages_response.data if messages_response.data else []
         
         message_count = len(messages)
-        chat_messages = len([m for m in messages if m.get('message_type') == 'chat'])
+        chat_messages = len(
+            [
+                m
+                for m in messages
+                if m.get("message_type") in ("chat", "chat_flagged")
+            ]
+        )
         moderator_messages = len([m for m in messages if m.get('message_type') in ['moderator', 'story', 'system', 'intervention']])
         
         # Get session count
@@ -796,7 +802,13 @@ def get_system_stats() -> Dict[str, Any]:
             },
             "messages": {
                 "total": len(messages),
-                "chat": len([m for m in messages if m.get('message_type') == 'chat']),
+                "chat": len(
+                    [
+                        m
+                        for m in messages
+                        if m.get("message_type") in ("chat", "chat_flagged")
+                    ]
+                ),
                 "system": len([m for m in messages if m.get('message_type') == 'system']),
                 "moderator": len([m for m in messages if m.get('message_type') == 'moderator']),
                 "story": len([m for m in messages if m.get('message_type') == 'story']),
@@ -1035,7 +1047,7 @@ def save_room_metrics(room_id: str):
         participant_data = []
         
         for p in participants:
-            if p['username'] == 'Moderator':
+            if p.get("username") in ("Moderator", "System"):
                 continue
             
             p_messages = [m for m in messages if m.get('username') == p['username']]
@@ -1055,29 +1067,59 @@ def save_room_metrics(room_id: str):
         total_messages = sum(message_counts)
         total_words = sum(word_counts)
         
-        # Speaking shares
-        shares = [c/total_messages if total_messages > 0 else 0 for c in message_counts]
+        # Speaking shares (same definition as handle_end_session)
+        shares = [c / total_messages if total_messages > 0 else 0 for c in message_counts]
         
-        # Gini coefficient
-        gini = calculate_gini_coefficient(message_counts)
+        # Gini on shares (0–1 inequality of the talk-time distribution)
+        gini = calculate_gini_coefficient(shares)
         
         # Dominance metrics
         max_share = max(shares) if shares else 0
         min_share = min(shares) if shares else 0
         dominance_gap = max_share - min_share
         
+        try:
+            from research_metrics import calculate_entropy, detect_conflict_episodes
+        except ImportError:
+            calculate_entropy = None  # type: ignore
+            detect_conflict_episodes = None  # type: ignore
+
+        participation_entropy = 0.0
+        if calculate_entropy:
+            participation_entropy = calculate_entropy(shares)
+
+        conflict_report = {"conflict_count": 0, "repair_count": 0, "repair_rate": 0.0}
+        if detect_conflict_episodes:
+            conflict_report = detect_conflict_episodes(room_id, messages)
+
+        repair_times = [
+            float(r["time_to_repair"])
+            for r in conflict_report.get("repairs", [])
+            if r.get("time_to_repair") is not None
+        ]
+        mean_time_to_repair = (
+            sum(repair_times) / len(repair_times) if repair_times else None
+        )
+
         # Save to research_metrics table
         metrics_data = {
             "room_id": room_id,
             "condition": room.get('mode'),
             "gini_coefficient": gini,
+            "participation_entropy": participation_entropy,
             "max_share": max_share,
             "min_share": min_share,
             "dominance_gap": dominance_gap,
             "total_messages": total_messages,
             "total_words": total_words,
+            "conflict_count": conflict_report.get("conflict_count", 0),
+            "repair_count": conflict_report.get("repair_count", 0),
+            "repair_rate": conflict_report.get("repair_rate", 0.0),
+            "ranking_submitted": bool(room.get("final_ranking")),
             "created_at": datetime.now(timezone.utc).isoformat()
         }
+        if mean_time_to_repair is not None:
+            metrics_data["mean_time_to_repair_seconds"] = mean_time_to_repair
         
         # Add ranking accuracy if available
         if room.get('final_ranking'):

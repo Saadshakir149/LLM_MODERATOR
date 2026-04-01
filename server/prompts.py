@@ -892,6 +892,8 @@ ONLY use the actual participant names: {participant_list_str}"""
                         'I', 'We', 'You', 'They', 'He', 'She', 'It', 'The', 'This', 'That', 'These', 'Those',
                         'Let', 'Let\'s', 'Lets', 'Id', 'I\'d', 'Ill', 'I\'ll', 'Im', 'I\'m', 'Ive', 'I\'ve',
                         'We\'re', 'We\'ll', 'We\'ve', 'We\'d', 'You\'re', 'You\'ll', 'You\'ve', 'You\'d',
+                        # Conjunctions / pronouns at sentence start (avoid false "fake name" on e.g. "But ...")
+                        'But', 'And', 'Or', 'For', 'Nor', 'Yet', 'So',
                         'Please', 'Thanks', 'Thank', 'Good', 'Great', 'Awesome', 'Interesting',
                         'What', 'How', 'Why', 'When', 'Where', 'Which', 'Who', 'Whom',
                         'Next', 'Start', 'Begin', 'Think', 'Thought', 'Help', 'Question', 'Answer',
@@ -931,39 +933,69 @@ def generate_passive_moderator_response(
     last_user_message: Optional[str] = None,
     time_elapsed: int = 0
 ) -> Optional[str]:
-    """Generate PASSIVE moderator response - ONLY when asked directly"""
+    """PASSIVE moderator: LLM answer when addressed; minimal template fallback."""
     try:
         if not last_user_message:
             return None
-        
-        # Filter out Moderator
-        actual_participants = [p for p in participants if p != 'Moderator' and p]
-        
+
+        actual_participants = [p for p in participants if p != "Moderator" and p]
         last_msg_lower = last_user_message.lower()
         time_remaining = max(0, 15 - time_elapsed)
-        
-        # Check if moderator was asked directly
-        asked_moderator = any([
-            '@moderator' in last_msg_lower,
-            'moderator' in last_msg_lower and '?' in last_user_message,
-            'what do you think' in last_msg_lower,
-            'your opinion' in last_msg_lower,
-            'help us' in last_msg_lower,
-            'can you help' in last_msg_lower,
-            'what should we' in last_msg_lower
-        ])
-        
+
+        asked_moderator = any(
+            [
+                "@moderator" in last_msg_lower,
+                "moderator" in last_msg_lower and "?" in last_user_message,
+                "what do you think" in last_msg_lower,
+                "your opinion" in last_msg_lower,
+                "help us" in last_msg_lower,
+                "can you help" in last_msg_lower,
+                "what should we" in last_msg_lower,
+            ]
+        )
+
         if not asked_moderator:
             return None
-        
-        # Simple, minimal response based on question type
-        if 'time' in last_msg_lower or 'minute' in last_msg_lower:
+
+        participant_list_str = ", ".join(actual_participants)
+        lines: List[str] = []
+        for m in (chat_history or [])[-14:]:
+            lines.append(f"{m.get('sender', '?')}: {m.get('message', '')}")
+        transcript = "\n".join(lines)
+
+        user_block = f"""Participants: {participant_list_str}
+Approx. minutes elapsed in session: {time_elapsed}
+Approx. minutes remaining: {time_remaining}
+
+Recent chat:
+{transcript}
+
+The user just said (addressing you):
+\"\"\"{last_user_message}\"\"\"
+
+Reply in 1–3 short sentences. Answer only what they asked. Do not invite quiet students, summarize the chat, or push the group toward a ranking. Stay neutral on which item is objectively “best” unless they ask for general survival principles. If you are unsure, say what information you would need."""
+
+        system = (
+            "You are a passive discussion moderator for a desert survival ranking exercise. "
+            "You only speak when directly addressed. Be concise, professional, and helpful."
+        )
+
+        if openai_client or groq_client:
+            reply = call_llm(
+                messages=[{"role": "user", "content": user_block}],
+                system_prompt=system,
+                temperature=0.55,
+                max_tokens=220,
+            )
+            if reply and len(reply.strip()) > 12:
+                return reply.strip()
+
+        if "time" in last_msg_lower or "minute" in last_msg_lower:
             return f"You have about {time_remaining} minutes remaining."
-        elif 'rank' in last_msg_lower or 'item' in last_msg_lower or 'task' in last_msg_lower:
+        if "rank" in last_msg_lower or "item" in last_msg_lower or "task" in last_msg_lower:
             return "You need to rank the 12 desert survival items from most important (1) to least important (12)."
-        else:
-            return "I'm observing the discussion. Continue with your task."
-            
+        return "I'm observing the discussion. Continue with your task."
+
     except Exception as e:
         logger.error(f"❌ [generate_passive_moderator_response] Error: {e}")
         return None
@@ -1000,6 +1032,7 @@ def generate_personalized_feedback(
     chat_history: List[Dict[str, Any]] = None,
     story_context: str = "",
     chat_sender_name: Optional[str] = None,
+    all_participants_data: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """
     Generate personalized feedback via Groq/OpenAI when configured, with template fallback.
@@ -1035,6 +1068,48 @@ def generate_personalized_feedback(
             else "(No messages sent.)"
         )
 
+        comparative_context = ""
+        engagement_rank = None
+        peer_count = 0
+        is_quietest = False
+        if all_participants_data:
+            peer_count = len(all_participants_data)
+            sorted_p = sorted(
+                all_participants_data,
+                key=lambda x: (x.get("message_count", 0), x.get("word_count", 0)),
+                reverse=True,
+            )
+            comparative_context = "\nCOMPARATIVE ENGAGEMENT (this session):\n"
+            medals = ["1st (most messages in the group)", "2nd", "3rd", "4th", "5th"]
+            for i, p in enumerate(sorted_p):
+                label = medals[i] if i < len(medals) else f"{i + 1}th"
+                comparative_context += (
+                    f"- {label}: {p.get('name', '?')} — "
+                    f"{p.get('message_count', 0)} messages, "
+                    f"~{p.get('share_of_talk', 0):.0f}% of student talk, "
+                    f"flagged messages: {p.get('toxic_count', 0)}\n"
+                )
+            order_names = [p.get("name") for p in sorted_p]
+            try:
+                engagement_rank = order_names.index(student_name) + 1
+            except ValueError:
+                engagement_rank = None
+            quietest = min(
+                all_participants_data, key=lambda x: x.get("message_count", 0)
+            )
+            is_quietest = quietest.get("name") == student_name
+
+        rank_line = (
+            f"\nTHIS STUDENT'S ENGAGEMENT RANK AMONG PEERS: {engagement_rank} of {peer_count}"
+            if engagement_rank and peer_count
+            else ""
+        )
+        quiet_line = (
+            "\nNOTE: This student had the FEWEST messages in the group — use warm, specific encouragement to speak up next time (without shaming)."
+            if is_quietest
+            else ""
+        )
+
         context = f"""STUDENT DISPLAY NAME: {student_name}
 CHAT USERNAME (for your awareness): {sender_key}
 MESSAGES SENT: {message_count}
@@ -1045,6 +1120,9 @@ STORY / TASK PROGRESS: {story_progress}%
 BEHAVIOR PROFILE: {behavior_type}
 HINTS / PROMPTS ANSWERED: {hint_responses}
 {share_hint}
+{rank_line}
+{quiet_line}
+{comparative_context}
 
 THEIR RECENT MESSAGES (newest last, truncated):
 {messages_block}
@@ -1053,16 +1131,17 @@ TASK / DISCUSSION CONTEXT:
 {story_context or "Desert survival ranking — collaborate and justify item order."}
 """
 
-        system_prompt = """You are an expert educational facilitator providing personalized, constructive feedback.
+        system_prompt = """You are an expert educational facilitator giving personalized, comparative feedback for a small-group exercise.
 
-Generate feedback with:
-1. A warm, personalized opening using the student's display name
-2. **Strengths:** (2-3 bullet points — cite specific ideas or behaviors from their messages when possible)
-3. **Areas for Improvement:** (1-2 bullet points; if inappropriate-language count > 0, mention professional tone respectfully)
-4. **Next Steps:** (1-2 concrete, actionable suggestions)
-5. A brief encouraging closing
+Structure the feedback exactly as follows:
+1. Warm opening using the student's display name.
+2. **Participation ranking:** State clearly where they placed compared to teammates (e.g. "You contributed the most / second-most / least among the three participants") using the data provided. Be kind if they were quietest.
+3. **Strengths:** 2–3 bullets with specific references to their messages when possible.
+4. **Areas for improvement:** 1–2 bullets. If they were the quietest participant, prioritize encouragement to share ideas early. If inappropriate-language count > 0, note professional communication briefly.
+5. **Next steps:** 1–2 actionable suggestions for the next session.
+6. Short encouraging closing.
 
-Be specific and professional. Return ONLY the feedback text (no preamble or meta-commentary)."""
+Return ONLY the feedback text (no meta-commentary)."""
 
         if not openai_client and not groq_client:
             logger.warning("⚠️ No LLM client for feedback; using template fallback")
