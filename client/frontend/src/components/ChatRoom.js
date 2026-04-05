@@ -427,11 +427,12 @@ export default function ChatRoom() {
     socket.on("session_ended", (data) => {
       console.log("📨 Session ended with data:", data);
       const feedback = data?.feedback || "Session ended. Thank you for participating!";
-      navigate("/feedback", { 
-        state: { 
+      navigate("/feedback", {
+        state: {
           feedback: feedback,
-          room_id: data?.room_id 
-        } 
+          room_id: data?.room_id,
+          studentName: userName,
+        },
       });
       setIsLoadingFeedback(false);
     });

@@ -1062,14 +1062,30 @@ Reply in 1–2 short sentences only. Answer exactly what they asked. No invitati
 # ============================================================
 # ✅ FEEDBACK GENERATION
 # ============================================================
+def _normalize_feedback_markdown(text: str) -> str:
+    """Fix common LLM quirks so ReactMarkdown renders bold/lists cleanly."""
+    t = (text or "").strip()
+    if not t:
+        return t
+    # Collapse accidental *** / **** runs (breaks parsers and shows junk)
+    t = re.sub(r"\*{3,}", "**", t)
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z0-9]*\s*", "", t)
+        t = re.sub(r"\s*```\s*$", "", t)
+    return t.strip()
+
+
 def format_feedback_response(response: str, student_name: str) -> str:
-    """Normalize LLM feedback into the standard UI wrapper."""
-    text = (response or "").strip()
+    """Normalize LLM feedback for markdown UI (FeedbackPage uses ReactMarkdown)."""
+    text = _normalize_feedback_markdown(response)
     if not text:
         return ""
-    if "**Your Feedback**" in text or "📊" in text:
-        return "\n" + text if not text.startswith("\n") else text
-    return f"\n📊 **Your Feedback**\n\n{text}"
+    low_start = text.lstrip()[:120].lower()
+    if text.lstrip().startswith("##"):
+        return text
+    if "your feedback" in low_start and "📊" in text[:80]:
+        return text
+    return f"## 📊 Your Feedback\n\n{text}"
 
 
 def get_fallback_feedback(
@@ -1190,17 +1206,23 @@ TASK / DISCUSSION CONTEXT:
 {story_context or "Desert survival ranking — collaborate and justify item order."}
 """
 
-        system_prompt = """You are an expert educational facilitator giving personalized, comparative feedback for a small-group exercise.
+        system_prompt = """You are an expert educational facilitator. Write personalized, comparative feedback as valid Markdown (rendered in a web UI with bold and lists).
 
-Structure the feedback exactly as follows:
-1. Warm opening using the student's display name.
-2. **Participation ranking:** State clearly where they placed compared to teammates (e.g. "You contributed the most / second-most / least among the three participants") using the data provided. Be kind if they were quietest.
-3. **Strengths:** 2–3 bullets with specific references to their messages when possible.
-4. **Areas for improvement:** 1–2 bullets. If they were the quietest participant, prioritize encouragement to share ideas early. If inappropriate-language count > 0, note professional communication briefly.
-5. **Next steps:** 1–2 actionable suggestions for the next session.
-6. Short encouraging closing.
+FORMATTING (required):
+- First line: ## 📊 Your Feedback — then a blank line.
+- Greeting paragraph using the STUDENT DISPLAY NAME from the context (e.g. Hi Name,).
+- Section labels on their own line, bold with a colon: **Participation ranking:** **Strengths:** **Areas for improvement:** **Next steps:**
+- After each section label, one blank line, then a markdown bullet list where every line starts with "- " (hyphen and space). Do not use • or * as bullet markers.
+- Use **only** pairs of double-asterisks for bold. Never output *** triple asterisks.
+- End with a short encouraging paragraph.
 
-Return ONLY the feedback text (no meta-commentary)."""
+CONTENT:
+- State clearly how they ranked vs peers using the data (be kind if they were quietest).
+- Strengths: 2–3 bullets referencing real messages when possible.
+- Improvements: 1–2 bullets; prioritize speaking up if quietest; if inappropriate-language count > 0, note professionalism briefly.
+- Next steps: 1–2 concrete actions.
+
+Return ONLY the markdown (no preamble, no markdown code fence)."""
 
         if not openai_client and not groq_client:
             logger.warning("⚠️ No LLM client for feedback; using template fallback")
@@ -1231,70 +1253,77 @@ Return ONLY the feedback text (no meta-commentary)."""
         )
 
 def generate_detailed_fallback(student_name: str, message_count: int, student_messages: List[str] = None, inappropriate_count: int = 0) -> str:
-    """Fallback feedback when LLM is unavailable"""
+    """Fallback feedback when LLM is unavailable (markdown for FeedbackPage)."""
     student_messages = student_messages or []
     last_message = student_messages[-1][:100] + "..." if student_messages else "participating"
-    
-    inappropriate_note = ""
-    if inappropriate_count > 0:
-        inappropriate_note = "\n• Remember to keep language professional and academic"
-    
+
+    prof_bullet = (
+        "\n- Remember to keep language professional and academic"
+        if inappropriate_count > 0
+        else ""
+    )
+
     if message_count == 0:
-        return f"""
-📊 **Your Feedback**
+        return f"""## 📊 Your Feedback
 
 Hi {student_name},
 
 Thank you for being part of our session today.
 
 **Strengths:**
-• You showed up and engaged silently
 
-**Areas for Improvement:**
-• Try sharing one small thought next time{inappropriate_note}
+- You showed up and stayed present for the discussion
 
-**Next Steps:**
-• Start with one observation next session
+**Areas for improvement:**
+
+- Try sharing one small thought next time{prof_bullet}
+
+**Next steps:**
+
+- Start with one observation next session
 
 I look forward to hearing from you!
 """
-    elif message_count <= 2:
-        return f"""
-📊 **Your Feedback**
+    if message_count <= 2:
+        return f"""## 📊 Your Feedback
 
 Hi {student_name},
 
 Thank you for your contributions!
 
 **Strengths:**
-• You were willing to participate
-• Your message about "{last_message}" showed engagement
 
-**Areas for Improvement:**
-• Try to elaborate more on your ideas{inappropriate_note}
+- You were willing to participate
+- Your message about "{last_message}" showed engagement
 
-**Next Steps:**
-• Try to share 2-3 times next session
+**Areas for improvement:**
+
+- Try to elaborate more on your ideas{prof_bullet}
+
+**Next steps:**
+
+- Aim to share two or three times next session
 
 Keep up the good work!
 """
-    else:
-        return f"""
-📊 **Your Feedback**
+    return f"""## 📊 Your Feedback
 
 Hi {student_name},
 
 Thank you for your active participation!
 
 **Strengths:**
-• You consistently engaged with the material
-• Your message about "{last_message}" showed creative thinking
 
-**Areas for Improvement:**
-• Try connecting your ideas to what others said{inappropriate_note}
+- You consistently engaged with the material
+- Your message about "{last_message}" showed creative thinking
 
-**Next Steps:**
-• Build on classmates' ideas
+**Areas for improvement:**
+
+- Try connecting your ideas to what others said{prof_bullet}
+
+**Next steps:**
+
+- Build on classmates' ideas in the next discussion
 
 Great work today!
 """
