@@ -111,6 +111,7 @@ from data_retriever import (
 # ============================================================
 from prompts import (
     generate_active_moderator_response,
+    generate_passive_moderator_response,
     generate_personalized_feedback,
     get_random_ending,
     check_inappropriate_language,
@@ -1251,22 +1252,34 @@ def start_active_moderator(room_id: str):
 # ============================================================
 # PASSIVE MODERATOR — ultra-minimal (research condition)
 # ============================================================
+def _passive_dedupe_key(msg: Dict[str, Any]) -> str:
+    """Stable id for deduping @moderator handling when DB id is missing."""
+    mid = msg.get("id")
+    if mid is not None and str(mid).strip() and str(mid) != "None":
+        return str(mid)
+    return "|".join(
+        [
+            str(msg.get("username") or ""),
+            str(msg.get("created_at") or ""),
+            (msg.get("message") or "")[:120],
+        ]
+    )
+
+
 def start_passive_moderator(room_id: str):
-    """Only @moderator + one 5-minute warning; hard cap on moderator turns."""
+    """Ultra-minimal: only @moderator (dynamic LLM) + one deduped 5-minute warning."""
 
     def monitor_loop():
         logger.info(f"🔴 PASSIVE moderator (minimal) for room {room_id}")
-        intervention_count = 0
-        MAX_INTERVENTIONS = 4  # passive research cap: @moderator replies + shared 5-min warning
-        last_passive_handled_msg_id: Optional[str] = None
+        # Do not use a single low cap for @moderator + warning — that silenced all pings after a few turns.
+        passive_at_mention_replies = 0
+        PASSIVE_MAX_AT_MENTIONS = 40
+        last_passive_handled_key: Optional[str] = None
+        five_min_warning_logged = False
 
         while True:
             try:
-                time.sleep(5)
-
-                if intervention_count >= MAX_INTERVENTIONS:
-                    time.sleep(25)
-                    continue
+                time.sleep(3)
 
                 room = get_room(room_id)
                 if not room or room.get("story_finished") or room.get("status") == "completed":
@@ -1289,44 +1302,82 @@ def start_passive_moderator(room_id: str):
                 time_elapsed = max(0, time_elapsed)
                 time_remaining = max(0, 15 - time_elapsed)
 
-                messages = get_chat_history(room_id, limit=8)
+                all_parts = get_participants(room_id)
+                participant_names = [
+                    p["username"]
+                    for p in all_parts
+                    if p.get("username") not in ("Moderator", "System", None, "")
+                ]
+
+                messages = get_chat_history(room_id, limit=40)
                 if messages:
                     last_msg = messages[-1]
-                    lm_id = str(last_msg.get("id", ""))
+                    dkey = _passive_dedupe_key(last_msg)
                     if last_msg.get("username") not in ("Moderator", "System"):
+                        body = (last_msg.get("message") or "").lower()
                         if (
-                            "@moderator" in (last_msg.get("message") or "").lower()
-                            and lm_id
-                            and lm_id != last_passive_handled_msg_id
+                            "@moderator" in body
+                            and dkey
+                            and dkey != last_passive_handled_key
                         ):
-                            last_passive_handled_msg_id = lm_id
-                            intervention_count += 1
-                            nitems = len(
-                                get_task_items(get_pinned_or_resolve_task_data(room_id))
-                            )
-                            resp = (
-                                f"Rank the **{nitems}** items from most important (**1**) to least "
-                                f"(**{nitems}**). About **{int(time_remaining)}** min left."
-                            )
-                            add_message(room_id, "Moderator", resp, "moderator")
-                            socketio.emit(
-                                "receive_message",
-                                chat_socket_payload("Moderator", resp),
-                                room=room_id,
-                            )
-                            log_moderator_intervention(
-                                room_id,
-                                "passive_at_mention",
-                                last_msg.get("username"),
-                            )
+                            if passive_at_mention_replies >= PASSIVE_MAX_AT_MENTIONS:
+                                logger.warning(
+                                    "⚠️ Passive @moderator cap reached for room %s",
+                                    room_id,
+                                )
+                            else:
+                                last_passive_handled_key = dkey
+                                passive_at_mention_replies += 1
+
+                                chat_for_llm = [
+                                    {
+                                        "sender": m.get("username") or "?",
+                                        "message": m.get("message") or "",
+                                    }
+                                    for m in messages
+                                    if m.get("username") not in ("Moderator", "System", None, "")
+                                ]
+
+                                resp = generate_passive_moderator_response(
+                                    participants=participant_names,
+                                    chat_history=chat_for_llm,
+                                    last_user_message=last_msg.get("message") or "",
+                                    time_elapsed=time_elapsed,
+                                )
+                                if not resp or len(resp.strip()) < 4:
+                                    nitems = len(
+                                        get_task_items(
+                                            get_pinned_or_resolve_task_data(room_id)
+                                        )
+                                    )
+                                    resp = (
+                                        f"Rank all **{nitems}** items from most important (**1**) to least "
+                                        f"(**{nitems}**). About **{int(time_remaining)}** min left."
+                                    )
+
+                                add_message(room_id, "Moderator", resp, "moderator")
+                                socketio.emit(
+                                    "receive_message",
+                                    chat_socket_payload("Moderator", resp),
+                                    room=room_id,
+                                )
+                                log_moderator_intervention(
+                                    room_id,
+                                    "passive_at_mention",
+                                    last_msg.get("username"),
+                                )
+                                logger.info(
+                                    "✅ Passive LLM reply to %s",
+                                    last_msg.get("username"),
+                                )
                             continue
 
                 if (
                     4 < time_remaining <= 5
-                    and intervention_count < MAX_INTERVENTIONS
+                    and not five_min_warning_logged
                     and claim_session_time_warning(room_id, "5")
                 ):
-                    intervention_count += 1
+                    five_min_warning_logged = True
                     warning = (
                         "⚠️ **5 minutes remaining!** Finalize your **complete ranking of all 12 items** "
                         "(1 = most important, 12 = least)."
@@ -1392,33 +1443,74 @@ def check_dominance(room_id: str) -> Optional[str]:
                 return user
     return None
 
+def _room_created_timestamp(room: Optional[Dict]) -> float:
+    """Unix time for room creation (fallback: now)."""
+    if not room:
+        return time.time()
+    created_at_val = room.get("created_at")
+    if not created_at_val:
+        return time.time()
+    try:
+        if isinstance(created_at_val, str):
+            return datetime.fromisoformat(
+                created_at_val.replace("Z", "+00:00")
+            ).timestamp()
+        if isinstance(created_at_val, (int, float)):
+            return float(created_at_val)
+    except Exception:
+        pass
+    return time.time()
+
+
 def check_silence(room_id: str) -> Optional[str]:
-    """Check if anyone hasn't spoken in 3 minutes"""
+    """
+    Triad rule: invite only if a participant has been quiet for SILENCE_THRESHOLD_SECONDS.
+    Per-user idle = time since their last student message; members who never spoke use
+    time since room creation until their first message exists.
+    """
     participants = get_participants(room_id)
-    if len(participants) < 3:
+    student_names = [
+        p["username"]
+        for p in participants
+        if p.get("username") and p["username"] not in ("Moderator", "System")
+    ]
+    if len(student_names) < 3:
         return None
-    
-    messages = get_chat_history(room_id, limit=50)
-    
+
+    messages = get_chat_history(room_id, limit=500)
     now = time.time()
-    cutoff = now - SILENCE_THRESHOLD_SECONDS  # 3 minutes
-    
-    recent_speakers = set()
+    room = get_room(room_id)
+    session_start = _room_created_timestamp(room)
+
+    last_student_msg_ts: Dict[str, float] = {}
     for msg in messages:
-        if msg['username'] == 'Moderator':
+        u = msg.get("username")
+        if u in ("Moderator", "System", None, ""):
             continue
         try:
-            msg_time = datetime.fromisoformat(msg['created_at'].replace('Z', '+00:00')).timestamp()
-            if msg_time > cutoff:
-                recent_speakers.add(msg['username'])
-        except:
+            ts = datetime.fromisoformat(
+                msg["created_at"].replace("Z", "+00:00")
+            ).timestamp()
+        except Exception:
             continue
-    
-    # Find who hasn't spoken
-    for p in participants:
-        if p['username'] != 'Moderator' and p['username'] not in recent_speakers:
-            return p['username']
-    return None
+        if u not in last_student_msg_ts or ts > last_student_msg_ts[u]:
+            last_student_msg_ts[u] = ts
+
+    best_user: Optional[str] = None
+    best_idle = -1.0
+    for name in student_names:
+        last_ts = last_student_msg_ts.get(name)
+        if last_ts is None:
+            idle = now - session_start
+        else:
+            idle = now - last_ts
+        if idle < SILENCE_THRESHOLD_SECONDS:
+            continue
+        if idle > best_idle:
+            best_idle = idle
+            best_user = name
+
+    return best_user
 
 # ============================================================
 # Submit Ranking Endpoint
