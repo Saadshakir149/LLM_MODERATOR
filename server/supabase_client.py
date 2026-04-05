@@ -1123,9 +1123,11 @@ def save_room_metrics(room_id: str):
         
         # Add ranking accuracy if available
         if room.get('final_ranking'):
-            from data_retriever import compare_with_expert_ranking
+            from data_retriever import compare_with_expert_ranking, get_pinned_or_resolve_task_data
+
             ranking = json.loads(room.get('final_ranking'))
-            comparison = compare_with_expert_ranking(ranking)
+            td = get_pinned_or_resolve_task_data(room_id)
+            comparison = compare_with_expert_ranking(ranking, td)
             metrics_data["ranking_accuracy"] = comparison['accuracy_percentage']
         
         supabase.table("research_metrics").insert(metrics_data).execute()
