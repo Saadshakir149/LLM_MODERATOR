@@ -228,7 +228,18 @@ room_last_expert_tip: Dict[str, float] = {}
 room_expert_tip_message_key: Dict[str, str] = {}
 room_active_moderator_aux: Dict[str, Dict[str, Any]] = {}
 last_item_clarification_at: Dict[str, float] = {}
-passive_five_min_warning_sent: Dict[str, bool] = {}
+# One 5-min and one 1-min warning per room across timer + active + passive threads
+room_time_warning_5min_claimed: Dict[str, bool] = {}
+room_time_warning_1min_claimed: Dict[str, bool] = {}
+
+
+def claim_session_time_warning(room_id: str, kind: str) -> bool:
+    """Return True if this code path may emit that warning (first claimant wins). kind: '5' or '1'."""
+    reg = room_time_warning_5min_claimed if kind == "5" else room_time_warning_1min_claimed
+    if reg.get(room_id):
+        return False
+    reg[room_id] = True
+    return True
 
 
 def collect_discussed_canonical_items(
@@ -595,16 +606,18 @@ def get_room_task_data(room_id: str) -> Optional[Dict[str, Any]]:
 # RESEARCH TIMER - 15 Minute Session Timer
 # ============================================================
 def start_research_timer(room_id: str):
-    """15-minute timer with warnings for research sessions"""
+    """15-minute timer with single 5- and 1-minute warnings (deduped with moderator loops)."""
     
     def timer_loop():
         # Wait 10 minutes (5 minutes remaining warning)
         time.sleep(10 * 60)
         
         room = get_room(room_id)
-        if room and room['status'] == 'active':
-            # 5 minutes remaining warning - FROM YOUR DESIGN
-            warning_msg = "⚠️ **5 minutes remaining!** Please work towards your final ranking. Can you agree on your top 3 items?"
+        if room and room['status'] == 'active' and claim_session_time_warning(room_id, "5"):
+            warning_msg = (
+                "⚠️ **5 minutes remaining!** Please finalize your **complete ranking of all 12 items** "
+                "from most important **(1)** to least important **(12)**."
+            )
             add_message(
                 room_id=room_id,
                 username="Moderator",
@@ -622,19 +635,23 @@ def start_research_timer(room_id: str):
             time.sleep(4 * 60)
             
             # 1 minute remaining
-            final_warning = "⏰ **1 minute remaining!** Please submit your final ranking now."
-            add_message(
-                room_id=room_id,
-                username="Moderator",
-                message=final_warning,
-                message_type="system"
-            )
-            
-            socketio.emit(
-                "receive_message",
-                chat_socket_payload("Moderator", final_warning),
-                room=room_id,
-            )
+            room = get_room(room_id)
+            if room and room['status'] == 'active' and claim_session_time_warning(room_id, "1"):
+                final_warning = (
+                    "⏰ **1 minute remaining!** Please submit your **full ranking of all 12 items** now."
+                )
+                add_message(
+                    room_id=room_id,
+                    username="Moderator",
+                    message=final_warning,
+                    message_type="system"
+                )
+                
+                socketio.emit(
+                    "receive_message",
+                    chat_socket_payload("Moderator", final_warning),
+                    room=room_id,
+                )
             
             # Give 1 more minute for submission
             time.sleep(60)
@@ -950,23 +967,17 @@ def start_active_moderator(room_id: str):
                     
                     last_silence_check = now
                 
-                # RULE 3: Time-based prompts (last 5 minutes)
-                if time_remaining <= 5 and time_remaining > 4 and now - last_intervention_time > 60:
-                    # Use LLM for time warning
-                    response = generate_active_moderator_response(
-                        participants=participant_names,
-                        chat_history=[{"sender": m['username'], "message": m['message']} for m in messages],
-                        task_context="Desert survival ranking",
-                        time_elapsed=time_elapsed,
-                        last_intervention_time=int(now - last_intervention_time),
-                        dominance_detected=None,
-                        silent_user=None
+                # RULE 3: Time-based prompts — single 5- and 1-min messages, ALL 12 items (deduped with research timer)
+                if (
+                    time_remaining <= 5
+                    and time_remaining > 4
+                    and now - last_intervention_time > 60
+                    and claim_session_time_warning(room_id, "5")
+                ):
+                    response = (
+                        f"⚠️ **{int(time_remaining)} minutes remaining!** Please finalize your **complete ranking of all 12 items** "
+                        "from most important **(1)** to least important **(12)**."
                     )
-                    
-                    # Fallback
-                    if not response or len(response) < 10:
-                        response = f"⚠️ We have {time_remaining} minutes remaining. Can you agree on your top 3 most important items?"
-                    
                     add_message(room_id, "Moderator", response, "moderator")
                     socketio.emit(
                         "receive_message",
@@ -976,7 +987,28 @@ def start_active_moderator(room_id: str):
                     
                     log_moderator_intervention(room_id, "time_warning", None)
                     last_intervention_time = now
-                    logger.info(f"✅ Sent time warning: {time_remaining} minutes remaining")
+                    logger.info(
+                        f"✅ Sent time warning: {time_remaining} minutes remaining"
+                    )
+
+                if (
+                    time_remaining <= 1
+                    and time_remaining > 0
+                    and now - last_intervention_time > 30
+                    and claim_session_time_warning(room_id, "1")
+                ):
+                    response = (
+                        "⏰ **Last minute!** Please submit your **full ranking of all 12 items** now."
+                    )
+                    add_message(room_id, "Moderator", response, "moderator")
+                    socketio.emit(
+                        "receive_message",
+                        chat_socket_payload("Moderator", response),
+                        room=room_id,
+                    )
+                    log_moderator_intervention(room_id, "time_warning_1m", None)
+                    last_intervention_time = now
+                    logger.info("✅ Sent 1-minute warning (active)")
                 
                 # RULE 4: Answer questions about the task
                 if messages and len(messages) > 0:
@@ -1164,7 +1196,6 @@ def start_passive_moderator(room_id: str):
         logger.info(f"🔴 PASSIVE moderator (minimal) for room {room_id}")
         intervention_count = 0
         MAX_INTERVENTIONS = 3
-        passive_five_min_warning_sent.pop(room_id, None)
         last_passive_handled_msg_id: Optional[str] = None
 
         while True:
@@ -1229,14 +1260,14 @@ def start_passive_moderator(room_id: str):
                             continue
 
                 if (
-                    not passive_five_min_warning_sent.get(room_id)
-                    and 4 < time_remaining <= 5
+                    4 < time_remaining <= 5
                     and intervention_count < MAX_INTERVENTIONS
+                    and claim_session_time_warning(room_id, "5")
                 ):
                     intervention_count += 1
-                    passive_five_min_warning_sent[room_id] = True
                     warning = (
-                        "⚠️ **5 minutes remaining**—please finalize your consensus ranking."
+                        "⚠️ **5 minutes remaining!** Finalize your **complete ranking of all 12 items** "
+                        "(1 = most important, 12 = least)."
                     )
                     add_message(room_id, "Moderator", warning, "system")
                     socketio.emit(

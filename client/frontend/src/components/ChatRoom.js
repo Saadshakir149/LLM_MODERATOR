@@ -320,6 +320,15 @@ export default function ChatRoom() {
     socket.on("receive_message", (data) => {
       console.log("📨 RECEIVED MESSAGE:", data);
 
+      if (
+        data?.sender === "Moderator" &&
+        typeof data.message === "string" &&
+        /5\s*minutes?\s*remaining/i.test(data.message)
+      ) {
+        setTimeWarning(true);
+        setShowRankingModal(true);
+      }
+
       setMessages((prev) => {
         const mid =
           data.id != null
@@ -562,14 +571,15 @@ export default function ChatRoom() {
             </h3>
             {timeWarning && (
               <span className="px-3 py-1 bg-red-100 text-red-700 rounded-full text-sm font-semibold flex items-center gap-1">
-                <MdWarning /> 2 minutes left
+                <MdWarning /> ~5 min or less
               </span>
             )}
           </div>
           
           <p className="text-gray-600 mb-4">
-            Drag and drop items to rank them from 1 (most important for survival) to 12 (least important).
-            Your group must agree on one final ranking.
+            Drag and drop items to rank them from <strong>1 (most important for survival)</strong> to{" "}
+            <strong>12 (least important)</strong>. Your group must agree on <strong>one final ranking of all 12 items</strong>{" "}
+            (every item appears exactly once).
           </p>
           
           {ranking.length === 0 ? (
@@ -693,7 +703,7 @@ export default function ChatRoom() {
 
                 {timeWarning && (
                   <span className="px-2 py-0.5 bg-red-500/30 rounded-full text-xs animate-pulse">
-                    ⏰ 2 min left
+                    ⏰ Time limited
                   </span>
                 )}
 

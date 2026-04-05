@@ -650,28 +650,25 @@ You MUST ONLY address these specific participants by their exact names shown abo
 Do NOT invent or use any other names like Rachel, Sarah, Michael, etc.
 
 YOUR ROLE:
-- Proactively guide the discussion
-- Ensure balanced participation
-- Invite quieter members by name
-- Gently manage dominant speakers
-- Keep discussion on track
-- Help group reach consensus within time limit
-- Answer questions about the task when asked
-- Be helpful and encouraging
+- Facilitate warmly: sound human, engaged, and appreciative of good reasoning
+- Reference specific items or points participants actually made when you can (use the recent chat excerpt)
+- Proactively guide toward one **full** consensus ranking of **all 12 items** (positions 1–12), not a partial list
+- Ensure balanced participation; invite quieter members by name; gently widen turns when one voice dominates
+- Answer questions about the task clearly
 
 BEHAVIOR RULES:
-1. If someone hasn't spoken in 3 minutes → invite them by name
-2. If one person contributes >50% of messages in last 5 minutes → gently ask others for their views
-3. Every 5 minutes → provide a brief summary of progress
-4. In last 5 minutes → remind group to finalize ranking
-5. Answer questions directly and helpfully
-6. Always be polite, encouraging, and neutral
+1. If someone hasn't spoken in 3 minutes → invite them by name, encouragingly
+2. If one person dominates → thank them briefly, then invite another participant by name
+3. Progress summaries → note what the group has actually debated (items, tradeoffs)
+4. Time pressure → remind them the deliverable is **one agreed ranking of all 12 items** from **1 (most important)** to **12 (least)**
+5. When someone builds consensus (“I agree”, “good point”) → acknowledge it, then push the ranking forward with one focused question
+6. Stay neutral on “the expert answer”; praise **reasoning**, not conclusions
 
 TASK: Desert survival ranking
 ITEMS TO RANK:
 {items}
 
-Remember: You are ACTIVE - you initiate, guide, and balance.
+Remember: You are ACTIVE—warm, specific, and brief (1–2 short sentences unless asked for more).
 ONLY use these participant names: {participant_list}
 """
 
@@ -775,6 +772,28 @@ def generate_active_moderator_response(
         
         # Format participant list for prompt
         participant_list_str = ", ".join(actual_participants)
+        chat_excerpt = chat_text.strip()
+        if len(chat_excerpt) > 1600:
+            chat_excerpt = "…\n" + chat_excerpt[-1600:]
+        
+        appreciation_cues = (
+            "good point",
+            "great point",
+            "i agree",
+            "agree with",
+            "makes sense",
+            "well said",
+            "exactly",
+            "nicely put",
+            "you're right",
+            "youre right",
+            "excellent",
+            "nice job",
+            "smart",
+            "totally",
+            "same here",
+            "second that",
+        )
         
         # Determine intervention type
         intervention_type = "normal"
@@ -797,16 +816,23 @@ def generate_active_moderator_response(
         
         # If not a question, check other intervention types
         if intervention_type == "normal":
-            if silent_user and time_elapsed > 3:
+            if chat_history:
+                lm = chat_history[-1]
+                if lm.get("sender") != "Moderator":
+                    lc = lm.get("message", "").lower()
+                    if any(c in lc for c in appreciation_cues):
+                        intervention_type = "appreciate"
+                        logger.info("👏 Appreciation / build-on mode")
+            if intervention_type == "normal" and silent_user and time_elapsed > 3:
                 intervention_type = "invite_silent"
                 logger.info(f"🤫 Will invite silent user: {silent_user}")
-            elif dominance_detected:
+            elif intervention_type == "normal" and dominance_detected:
                 intervention_type = "balance_dominance"
                 logger.info(f"👑 Will balance dominance for: {dominance_detected}")
-            elif time_remaining <= 5:
+            elif intervention_type == "normal" and time_remaining <= 5:
                 intervention_type = "time_warning"
                 logger.info(f"⏰ Will give time warning")
-            elif time_elapsed > 0 and time_elapsed % 5 == 0:
+            elif intervention_type == "normal" and time_elapsed > 0 and time_elapsed % 5 == 0:
                 intervention_type = "summarize"
                 logger.info(f"📊 Will provide summary")
         
@@ -815,43 +841,75 @@ def generate_active_moderator_response(
         # Create prompt with ACTUAL participant names
         if intervention_type == "answer_question":
             last_question = chat_history[-1].get('message', '') if chat_history else ''
-            prompt = f"""You are an ACTIVE moderator. The participants are: {participant_list_str}
+            prompt = f"""Participants: {participant_list_str}
 
-The last user message was: "{last_question}"
+Recent discussion (for context—stay grounded in it):
+{chat_excerpt}
 
-Please answer their question helpfully and concisely in 1-2 sentences. 
-If they're asking about the task, explain that they need to rank the 12 desert survival items from most important (1) to least important (12).
-If they're asking about time, tell them they have {time_remaining} minutes remaining.
-ONLY use the actual participant names: {participant_list_str}"""
+The last message was: "{last_question}"
+
+Answer in 1–2 short, conversational sentences. If it's about the task, say clearly they must agree on **one full ranking of all 12 items** from **1 (most important)** to **12 (least)**. If it's about time, say ~{time_remaining} minutes remain. Reference a specific item or concern from the chat if you can.
+ONLY use these participant names: {participant_list_str}"""
         
         elif intervention_type == "invite_silent" and silent_user in actual_participants:
-            prompt = f"""You are an ACTIVE moderator. The participants are: {participant_list_str}
-{silent_user} hasn't spoken in a while. Politely invite them to share their thoughts on the desert survival ranking in 1 sentence.
-ONLY use the actual participant names: {participant_list_str}"""
+            prompt = f"""Participants: {participant_list_str}
+
+Recent chat:
+{chat_excerpt}
+
+{silent_user} has been quiet. In **one warm sentence**, invite them by name to react to what others just said about specific items or priorities. Mention something concrete from the chat.
+ONLY use these participant names: {participant_list_str}"""
         
         elif intervention_type == "balance_dominance" and dominance_detected in actual_participants:
             other_participants = [p for p in actual_participants if p != dominance_detected]
-            prompt = f"""You are an ACTIVE moderator. The participants are: {participant_list_str}
-{dominance_detected} has been dominating the conversation. Gently ask {', '.join(other_participants)} for their perspective in 1 sentence.
-ONLY use the actual participant names: {participant_list_str}"""
+            prompt = f"""Participants: {participant_list_str}
+
+Recent chat:
+{chat_excerpt}
+
+Thank {dominance_detected} briefly for their ideas, then in the **same breath** ask {", ".join(other_participants[:2])} how they’d rank **one specific item** from the list (name the item). One or two short sentences.
+ONLY use these participant names: {participant_list_str}"""
         
         elif intervention_type == "time_warning":
-            prompt = f"""You are an ACTIVE moderator. The participants are: {participant_list_str}
-Only {time_remaining} minutes left. Remind the group to work towards finalizing their ranking in 1 sentence.
-ONLY use the actual participant names: {participant_list_str}"""
+            prompt = f"""Participants: {participant_list_str}
+
+Recent chat:
+{chat_excerpt}
+
+Only ~{time_remaining} minutes left. One encouraging sentence: they need **one agreed list ranking all 12 desert items** from **1** to **12**.
+ONLY use these participant names: {participant_list_str}"""
         
         elif intervention_type == "summarize":
-            prompt = f"""You are an ACTIVE moderator. The participants are: {participant_list_str}
-Based on this chat history: {chat_text[:200]}...
-Provide a brief summary of their progress so far in 1-2 sentences.
-ONLY use the actual participant names: {participant_list_str}"""
+            prompt = f"""Participants: {participant_list_str}
+
+Recent chat:
+{chat_excerpt}
+
+Give a **brief** progress recap (1–2 sentences): what items or arguments have come up, and what’s still unsettled. Sound engaged, not robotic.
+ONLY use these participant names: {participant_list_str}"""
+        
+        elif intervention_type == "appreciate":
+            last_who = chat_history[-1].get("sender", "") if chat_history else ""
+            last_snip = chat_history[-1].get("message", "") if chat_history else ""
+            prompt = f"""Participants: {participant_list_str}
+
+Recent chat:
+{chat_excerpt}
+
+{last_who} just said: "{last_snip[:220]}"
+
+Acknowledge that contribution warmly in your own words, then ask **one** focused question to move the **full 12-item ranking** forward (name an item or tradeoff if possible). 1–2 short sentences.
+ONLY use these participant names: {participant_list_str}"""
         
         else:
             # Normal facilitation
-            prompt = f"""You are an ACTIVE moderator. The participants are: {participant_list_str}
-Based on this chat history: {chat_text[:200]}...
-Provide a natural, helpful facilitation message to keep the discussion moving in 1 sentence.
-ONLY use the actual participant names: {participant_list_str}"""
+            prompt = f"""Participants: {participant_list_str}
+
+Recent chat:
+{chat_excerpt}
+
+Give one natural facilitation line: react to something **specific** someone said, then nudge the trio toward resolving the next ranking disagreement. Warm and specific beats generic.
+ONLY use these participant names: {participant_list_str}"""
         
         logger.info(f"📝 Prompt created (type: {intervention_type})")
         logger.info(f"   Prompt preview: {prompt[:150]}...")
@@ -866,13 +924,24 @@ ONLY use the actual participant names: {participant_list_str}"""
         logger.info(f"📤 About to call call_llm...")
         
         # Call LLM with proper parameters
+        temp_map = {
+            "appreciate": 0.78,
+            "normal": 0.78,
+            "summarize": 0.72,
+            "answer_question": 0.65,
+            "invite_silent": 0.72,
+            "balance_dominance": 0.62,
+            "time_warning": 0.65,
+        }
+        call_temp = temp_map.get(intervention_type, 0.72)
+
         response = call_llm(
             messages=[
                 {"role": "user", "content": prompt}
             ],
             system_prompt=system_prompt,
-            temperature=0.7 if intervention_type == "normal" else 0.5,
-            max_tokens=150
+            temperature=call_temp,
+            max_tokens=180,
         )
         
         if response:
@@ -911,18 +980,34 @@ ONLY use the actual participant names: {participant_list_str}"""
                         break
             
             if fake_name_detected:
-                return get_fallback_response()
+                return _active_engaging_fallback(actual_participants, time_remaining)
             
             logger.info(f"✅ Final response: {text[:150]}...")
             return text
         
         logger.warning("⚠️ No response from LLM, using fallback")
-        return get_fallback_response()
+        return _active_engaging_fallback(actual_participants, time_remaining)
             
     except Exception as e:
         logger.error(f"❌ [generate_active_moderator_response] Error: {e}")
         logger.error(traceback.format_exc())
-        return get_fallback_response()
+        ap = [p for p in participants if p != "Moderator" and p]
+        tr = max(0, 15 - time_elapsed)
+        return _active_engaging_fallback(ap, tr)
+
+
+def _active_engaging_fallback(
+    actual_participants: List[str], time_remaining: int
+) -> str:
+    """Short, warm fallbacks that still sound human if Groq/OpenAI fails."""
+    a, b = (actual_participants + ["everyone", "team"])[:2]
+    lines = [
+        f"Nice momentum—{a}, what's one item you'd move up or down on the full 12-item list, and why?",
+        f"I'm following the thread—{b}, how would you rank the mirror vs. water tradeoff the group raised?",
+        f"Great teamwork so far. With ~{time_remaining} minutes left, can you lock the next two positions on your shared ranking?",
+        f"Thanks for the careful debate—{a}, what's still the biggest disagreement on the 12-item order?",
+    ]
+    return random.choice(lines)
 
 # ============================================================
 # 💬 PASSIVE MODERATOR RESPONSE GENERATOR - ADD THIS FUNCTION
