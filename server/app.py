@@ -96,6 +96,11 @@ from data_retriever import (
     get_story_intro_html,
     get_task_items,
     compare_with_expert_ranking,
+    resolve_task_data_from_room,
+    pin_task_data_for_room,
+    get_pinned_or_resolve_task_data,
+    get_canonical_items_for_room,
+    clarify_alias_against_list,
 )
 
 # ============================================================
@@ -221,6 +226,79 @@ room_sessions: Dict[str, str] = {}  # room_id -> session_id
 research_timers: Dict[str, threading.Thread] = {}  # room_id -> timer thread
 room_last_expert_tip: Dict[str, float] = {}
 room_expert_tip_message_key: Dict[str, str] = {}
+room_active_moderator_aux: Dict[str, Dict[str, Any]] = {}
+last_item_clarification_at: Dict[str, float] = {}
+passive_five_min_warning_sent: Dict[str, bool] = {}
+
+
+def collect_discussed_canonical_items(
+    messages: List[dict], canonical_items: List[str]
+) -> set:
+    """Distict official item lines explicitly referenced in student chat."""
+    out: set = set()
+    for m in messages:
+        if m.get("username") in ("Moderator", "System"):
+            continue
+        low = (m.get("message") or "").lower()
+        for item in canonical_items:
+            il = item.lower()
+            if len(il) >= 6 and il in low:
+                out.add(item)
+    return out
+
+
+def trailing_student_streak(messages: List[dict]) -> tuple:
+    """How many consecutive student messages at the end, same speaker (moderator breaks)."""
+    streak_user = None
+    streak = 0
+    for m in reversed(messages):
+        u = m.get("username")
+        if u in ("Moderator", "System"):
+            break
+        if u is None:
+            continue
+        if streak_user is None:
+            streak_user = u
+            streak = 1
+        elif u == streak_user:
+            streak += 1
+        else:
+            break
+    return streak_user, streak
+
+
+def record_first_mention(
+    attribution: Dict[str, str],
+    speaker: Optional[str],
+    text: str,
+    canonical_items: List[str],
+) -> None:
+    """First speaker to mention an item/topic wins (research attribution)."""
+    if not speaker or speaker in ("Moderator", "System"):
+        return
+    low = (text or "").lower()
+    for item in canonical_items:
+        il = item.lower()
+        if len(il) >= 6 and il in low:
+            attribution.setdefault(il[:48], speaker)
+            return
+    for topic in (
+        "water",
+        "mirror",
+        "flashlight",
+        "tarp",
+        "compass",
+        "map",
+        "knife",
+        "lighter",
+        "jacket",
+        "salt",
+        "blanket",
+        "parachute",
+    ):
+        if topic in low:
+            attribution.setdefault(topic, speaker)
+            return
 
 
 def chat_socket_payload(sender: str, message: str, **extra: Any) -> dict:
@@ -506,13 +584,12 @@ def export_room_full(room_id: str):
 # Helper: Get Room Task Data
 # ============================================================
 def get_room_task_data(room_id: str) -> Optional[Dict[str, Any]]:
-    """Load task data for room (always desert survival)"""
+    """Pinned scenario for this room (same item strings everywhere)."""
     room = get_room(room_id)
     if not room:
         logger.warning(f"⚠️ No room found {room_id}")
         return None
-
-    return get_data()  # Always returns desert survival task
+    return get_pinned_or_resolve_task_data(room_id)
 
 # ============================================================
 # RESEARCH TIMER - 15 Minute Session Timer
@@ -603,6 +680,9 @@ def start_task_for_room(room_id: str):
 
         logger.info(f"🎬 Starting desert survival task for room {room_id} with {student_count} students")
 
+        task_data = resolve_task_data_from_room(room)
+        pin_task_data_for_room(room_id, task_data)
+
         # Update room status
         update_room_status(room_id, 'active')
 
@@ -616,7 +696,6 @@ def start_task_for_room(room_id: str):
         room_sessions[room_id] = session['id']
 
         # Send task intro
-        task_data = get_room_task_data(room_id)
         if task_data:
             intro = get_story_intro_html(task_data)
             logger.info(f"📋 Sending task intro (HTML) to room {room_id}")
@@ -713,6 +792,61 @@ def start_active_moderator(room_id: str):
                 # If less than 3 participants, skip (shouldn't happen but just in case)
                 if len(participant_names) < 3:
                     continue
+
+                td_active = get_pinned_or_resolve_task_data(room_id)
+                canonical_items = get_task_items(td_active)
+                n_target = len(canonical_items) or 12
+
+                aux = room_active_moderator_aux.setdefault(
+                    room_id,
+                    {
+                        "last_progress_summary_time": now,
+                        "last_summary_discussed_len": 0,
+                        "statement_attribution": {},
+                        "last_attr_msg_id": None,
+                        "last_turn_balance_msg_id": None,
+                    },
+                )
+
+                if messages:
+                    lm = messages[-1]
+                    mid = str(lm.get("id", ""))
+                    if mid and mid != str(aux.get("last_attr_msg_id") or ""):
+                        if lm.get("username") not in ("Moderator", "System"):
+                            record_first_mention(
+                                aux["statement_attribution"],
+                                lm.get("username"),
+                                lm.get("message") or "",
+                                canonical_items,
+                            )
+                        aux["last_attr_msg_id"] = mid
+
+                streak_user, streak = trailing_student_streak(messages)
+                last_mid = str(messages[-1].get("id", "")) if messages else ""
+                if (
+                    streak >= 3
+                    and streak_user
+                    and last_mid
+                    and last_mid != str(aux.get("last_turn_balance_msg_id") or "")
+                    and now - last_intervention_time > 45
+                ):
+                    others = [p for p in participant_names if p != streak_user]
+                    if others:
+                        force_response = (
+                            f"{streak_user}, you've made several points—let's hear from "
+                            f"{others[0]} on the ranking too."
+                        )
+                        add_message(room_id, "Moderator", force_response, "moderator")
+                        socketio.emit(
+                            "receive_message",
+                            chat_socket_payload("Moderator", force_response),
+                            room=room_id,
+                        )
+                        log_moderator_intervention(
+                            room_id, "force_turn_balance", streak_user
+                        )
+                        aux["last_turn_balance_msg_id"] = last_mid
+                        last_intervention_time = now
                 
                 # ===== ACTIVE MODERATOR RULES =====
                 
@@ -928,7 +1062,7 @@ def start_active_moderator(room_id: str):
                             f"{tip_msg.get('username')}|{tip_msg.get('created_at', '')}|{raw_tip[:160]}"
                         )
                         if room_expert_tip_message_key.get(room_id) != tip_fingerprint:
-                            for item_label in get_task_items():
+                            for item_label in canonical_items:
                                 il = item_label.lower()
                                 if len(il) >= 6 and il in low_tip:
                                     room_expert_tip_message_key[room_id] = tip_fingerprint
@@ -936,8 +1070,15 @@ def start_active_moderator(room_id: str):
                                     if opinion and (
                                         now - room_last_expert_tip.get(room_id, 0) > 90
                                     ) and (now - last_intervention_time > 50):
+                                        ikey = il[:48]
+                                        orig = aux["statement_attribution"].get(ikey)
+                                        spk = tip_msg.get("username")
+                                        prefix = ""
+                                        if orig and orig != spk:
+                                            prefix = f"As **{orig}** raised that item, "
                                         response = (
-                                            f"📚 Expert perspective on “{item_label}”: {opinion}\n\n"
+                                            prefix
+                                            + f"📚 Expert perspective on “{item_label}”: {opinion}\n\n"
                                             "How does that fit with your group's ranking so far?"
                                         )
                                         add_message(
@@ -963,34 +1104,44 @@ def start_active_moderator(room_id: str):
                                         )
                                     break
                 
-                # RULE 5: Periodic summaries (every 5 minutes)
-                if time_elapsed > 0 and time_elapsed % 5 == 0 and now - last_intervention_time > 60:
-                    # Use LLM for summary
-                    response = generate_active_moderator_response(
-                        participants=participant_names,
-                        chat_history=[{"sender": m['username'], "message": m['message']} for m in messages],
-                        task_context="Desert survival ranking",
-                        time_elapsed=time_elapsed,
-                        last_intervention_time=int(now - last_intervention_time),
-                        dominance_detected=None,
-                        silent_user=None
+                # RULE 5: Periodic progress recap (every 5 min clock OR 3+ newly discussed items)
+                discussed = collect_discussed_canonical_items(messages, canonical_items)
+                time_since_recap = now - aux["last_progress_summary_time"]
+                new_since_recap = len(discussed) - aux["last_summary_discussed_len"]
+                if (time_since_recap >= 300 or new_since_recap >= 3) and (
+                    now - last_intervention_time > 60
+                ):
+                    mins = max(1, int(time_since_recap // 60))
+                    summary_lines = [
+                        "📊 **Progress update** (quick recap):",
+                        f"- About **{mins}** min since the last progress check.",
+                    ]
+                    if discussed:
+                        preview = ", ".join(sorted(discussed)[:5])
+                        if len(discussed) > 5:
+                            preview += "…"
+                        summary_lines.append(
+                            f"- Items clearly on the table in chat: {preview}"
+                        )
+                    gap = max(0, n_target - len(discussed))
+                    summary_lines.append(
+                        f"- Rough gauge: **{gap}** list item(s) not clearly discussed yet."
                     )
-                    
-                    # Fallback
-                    if not response or len(response) < 10:
-                        msg_count = len([m for m in messages if m.get('username') != 'Moderator'])
-                        response = f"📊 {time_elapsed} minutes have passed. You've sent {msg_count} messages. Keep discussing to reach consensus on the item ranking."
-                    
-                    add_message(room_id, "Moderator", response, "moderator")
+                    summary_lines.append(
+                        f"- ⏰ About **{int(time_remaining)}** min left in the session."
+                    )
+                    summary = "\n".join(summary_lines)
+                    add_message(room_id, "Moderator", summary, "moderator")
                     socketio.emit(
                         "receive_message",
-                        chat_socket_payload("Moderator", response),
+                        chat_socket_payload("Moderator", summary),
                         room=room_id,
                     )
-                    
-                    log_moderator_intervention(room_id, "summary", None)
+                    log_moderator_intervention(room_id, "progress_summary", None)
                     last_intervention_time = now
-                    logger.info(f"✅ Sent summary at {time_elapsed} minutes")
+                    aux["last_progress_summary_time"] = now
+                    aux["last_summary_discussed_len"] = len(discussed)
+                    logger.info("✅ Sent structured progress summary")
                 
             except Exception as e:
                 logger.error(f"❌ Error in active moderator loop: {e}")
@@ -1004,140 +1155,103 @@ def start_active_moderator(room_id: str):
     return thread
 
 # ============================================================
-# PASSIVE MODERATOR - FIXED VERSION
+# PASSIVE MODERATOR — ultra-minimal (research condition)
 # ============================================================
 def start_passive_moderator(room_id: str):
-    """Passive moderator - only responds when asked, minimal interventions"""
-    
+    """Only @moderator + one 5-minute warning; hard cap on moderator turns."""
+
     def monitor_loop():
-        logger.info(f"🔴 PASSIVE moderator started for room {room_id}")
-        
-        last_response_time = time.time()
-        
+        logger.info(f"🔴 PASSIVE moderator (minimal) for room {room_id}")
+        intervention_count = 0
+        MAX_INTERVENTIONS = 3
+        passive_five_min_warning_sent.pop(room_id, None)
+        last_passive_handled_msg_id: Optional[str] = None
+
         while True:
             try:
-                time.sleep(3)  # Check frequently for messages directed at moderator
-                
+                time.sleep(5)
+
+                if intervention_count >= MAX_INTERVENTIONS:
+                    time.sleep(25)
+                    continue
+
                 room = get_room(room_id)
-                if not room or room.get('story_finished') or room['status'] == 'completed':
+                if not room or room.get("story_finished") or room.get("status") == "completed":
                     logger.info(f"⏹️ Passive moderator stopped for room {room_id}")
                     break
-                
+
                 now = time.time()
-                
-                # ===== SAFE TIME CALCULATION =====
                 time_elapsed = 0
-                created_at_val = room.get('created_at')
-                
+                created_at_val = room.get("created_at")
                 if created_at_val:
                     try:
                         if isinstance(created_at_val, str):
-                            created_at_val = created_at_val.replace('Z', '+00:00')
-                            created_at_dt = datetime.fromisoformat(created_at_val)
+                            cv = created_at_val.replace("Z", "+00:00")
+                            created_at_dt = datetime.fromisoformat(cv)
                             time_elapsed = int((now - created_at_dt.timestamp()) / 60)
                         elif isinstance(created_at_val, (int, float)):
                             time_elapsed = int((now - float(created_at_val)) / 60)
-                    except Exception as e:
-                        logger.warning(f"Could not parse created_at: {e}")
+                    except Exception:
                         time_elapsed = 0
-                
                 time_elapsed = max(0, time_elapsed)
                 time_remaining = max(0, 15 - time_elapsed)
-                time_remaining_int = int(time_remaining)
-                
-                # Check if anyone asked the moderator
-                messages = get_chat_history(room_id, limit=10)
-                if messages and len(messages) > 0:
+
+                messages = get_chat_history(room_id, limit=8)
+                if messages:
                     last_msg = messages[-1]
-                    
-                    # Only respond if message is directed at moderator
-                    if last_msg.get('username') != 'Moderator':
-                        msg_text = last_msg.get('message', '').lower()
-                        full_msg = last_msg.get('message', '')
-                        
-                        # ===== FIXED: Better moderator detection =====
-                        asked_moderator = False
-                        
-                        # Check for @moderator (most explicit)
-                        if '@moderator' in msg_text:
-                            asked_moderator = True
-                            logger.info(f"   ✓ @moderator detected")
-                        
-                        # Check for "moderator" with question mark
-                        elif 'moderator' in msg_text and '?' in full_msg:
-                            asked_moderator = True
-                            logger.info(f"   ✓ 'moderator' with ? detected")
-                        
-                        # Check for common question phrases
-                        elif any(phrase in msg_text for phrase in [
-                            'what do you think', 'your opinion', 'help us', 
-                            'can you help', 'what should we', 'tell us'
-                        ]):
-                            asked_moderator = True
-                            logger.info(f"   ✓ question phrase detected")
-                        
-                        if asked_moderator and (now - last_response_time > 10):
-                            logger.info(f"🗣️ Moderator asked directly in room {room_id} by {last_msg.get('username')}")
-                            
-                            # Get actual participants
-                            all_participants = get_participants(room_id)
-                            participant_names = [p['username'] for p in all_participants if p['username'] != 'Moderator']
-                            
-                            # Generate passive response using the dedicated function
-                            response = generate_passive_moderator_response(
-                                participants=participant_names,
-                                chat_history=[{"sender": m['username'], "message": m['message']} for m in messages],
-                                last_user_message=full_msg,
-                                time_elapsed=time_elapsed
+                    lm_id = str(last_msg.get("id", ""))
+                    if last_msg.get("username") not in ("Moderator", "System"):
+                        if (
+                            "@moderator" in (last_msg.get("message") or "").lower()
+                            and lm_id
+                            and lm_id != last_passive_handled_msg_id
+                        ):
+                            last_passive_handled_msg_id = lm_id
+                            intervention_count += 1
+                            nitems = len(
+                                get_task_items(get_pinned_or_resolve_task_data(room_id))
                             )
-                            
-                            # Fallback if no response
-                            if not response:
-                                if 'time' in msg_text or 'minute' in msg_text:
-                                    response = f"You have about {time_remaining_int} minutes remaining."
-                                elif 'rank' in msg_text or 'item' in msg_text or 'task' in msg_text:
-                                    response = "You need to rank the 12 desert survival items from most important (1) to least important (12)."
-                                else:
-                                    response = "I'm observing the discussion. Continue with your task."
-                            
-                            add_message(room_id, "Moderator", response, "moderator")
+                            resp = (
+                                f"Rank the **{nitems}** items from most important (**1**) to least "
+                                f"(**{nitems}**). About **{int(time_remaining)}** min left."
+                            )
+                            add_message(room_id, "Moderator", resp, "moderator")
                             socketio.emit(
                                 "receive_message",
-                                chat_socket_payload("Moderator", response),
+                                chat_socket_payload("Moderator", resp),
                                 room=room_id,
                             )
-                            
-                            log_moderator_intervention(room_id, "responded_to_question", last_msg.get('username'))
-                            last_response_time = now
-                            logger.info(f"✅ Responded to question from {last_msg.get('username')}: {response[:100]}...")
-                
-                # ONLY time reminder near the end (5 minutes remaining) - same as active for fairness
-                if time_remaining_int == 5 and (now - last_response_time > 60):
-                    warning_msg = "⚠️ **5 minutes remaining!** Please work towards your final ranking."
-                    add_message(
-                        room_id=room_id,
-                        username="Moderator",
-                        message=warning_msg,
-                        message_type="system"
+                            log_moderator_intervention(
+                                room_id,
+                                "passive_at_mention",
+                                last_msg.get("username"),
+                            )
+                            continue
+
+                if (
+                    not passive_five_min_warning_sent.get(room_id)
+                    and 4 < time_remaining <= 5
+                    and intervention_count < MAX_INTERVENTIONS
+                ):
+                    intervention_count += 1
+                    passive_five_min_warning_sent[room_id] = True
+                    warning = (
+                        "⚠️ **5 minutes remaining**—please finalize your consensus ranking."
                     )
-                    
+                    add_message(room_id, "Moderator", warning, "system")
                     socketio.emit(
                         "receive_message",
-                        chat_socket_payload("Moderator", warning_msg),
+                        chat_socket_payload("Moderator", warning),
                         room=room_id,
                     )
-                    
-                    log_moderator_intervention(room_id, "time_warning", None)
-                    last_response_time = now
-                    logger.info(f"✅ Sent time warning at 5 minutes")
-                
-                time.sleep(5)
-                
+                    log_moderator_intervention(room_id, "time_warning_passive", None)
+                    time.sleep(55)
+
             except Exception as e:
-                logger.error(f"❌ Error in passive moderator loop: {e}")
+                logger.error(f"❌ Passive moderator error: {e}")
                 logger.error(traceback.format_exc())
                 time.sleep(5)
-    
+
     thread = threading.Thread(target=monitor_loop, daemon=True)
     thread.start()
     active_monitors[room_id] = thread
@@ -1231,8 +1345,8 @@ def handle_submit_ranking(data):
             "ranking_submitted_at": datetime.now(timezone.utc).isoformat()
         }).eq("id", room_id).execute()
         
-        # Compare with expert ranking
-        comparison = compare_with_expert_ranking(ranking)
+        td = get_room_task_data(room_id) or get_data()
+        comparison = compare_with_expert_ranking(ranking, td)
         logger.info(f"📈 Ranking accuracy: {comparison['accuracy_percentage']:.1f}%")
         
         # Save metrics
@@ -1285,14 +1399,14 @@ def auto_join_room(mode: str):
         except Exception as e:
             logger.error(f"❌ Error listing rooms: {e}")
 
-        # Get desert survival task (always same)
         task_data = get_data()
-        story_id = task_data.get('task_id', 'desert_survival')
+        story_id = task_data.get("task_id") or "desert_survival_plane_crash"
         logger.info(f"📚 Using task: {story_id}")
 
         # Get or create room
         room = get_or_create_room(mode=mode, story_id=story_id)
         room_id = room['id']
+        pin_task_data_for_room(room_id, resolve_task_data_from_room(room))
 
         logger.info(f"✅ Room assigned: {room_id} (mode={mode}, participants={room.get('participant_count', 0)}/3)")
 
@@ -1346,7 +1460,19 @@ def get_room_info(room_id: str):
 
 @app.route("/api/desert-items")
 def get_desert_items_api():
-    """Desert survival item list for the persistent chat sidebar."""
+    """Item list for UI; use ?room_id= for the exact strings pinned to that session."""
+    room_id = (request.args.get("room_id") or "").strip()
+    if room_id:
+        bundle = get_canonical_items_for_room(room_id)
+        items = bundle["items"]
+        return jsonify(
+            {
+                "items": items,
+                "count": len(items),
+                "task_id": bundle.get("task_id"),
+                "task_name": bundle.get("task_name"),
+            }
+        )
     items = get_task_items()
     return jsonify({"items": items, "count": len(items)})
 
@@ -1365,11 +1491,12 @@ def create_room_handler(data):
 
     try:
         story_data = get_data()
-        story_id = story_data.get('story_id', 'default-story')
+        story_id = story_data.get("task_id") or "desert_survival_plane_crash"
 
         from supabase_client import create_room
         room = create_room(mode=mode, story_id=story_id)
         room_id = room['id']
+        pin_task_data_for_room(room_id, story_data)
 
         logger.info(f"✅ Room created: {room_id}")
 
@@ -1426,6 +1553,8 @@ def join_room_handler(data):
             logger.warning(f"⚠️ Room not found: {room_id}")
             emit("error", {"message": "Room not found"})
             return
+
+        pin_task_data_for_room(room_id, resolve_task_data_from_room(room))
 
         # Check if participant already exists in this room
         existing_participant = get_participant_by_username(room_id, user_name)
@@ -1621,6 +1750,24 @@ def send_message_handler(data):
             room=room_id,
         )
 
+        try:
+            td = get_pinned_or_resolve_task_data(room_id)
+            items = get_task_items(td)
+            clar = clarify_alias_against_list(msg, items)
+            if clar:
+                nowc = time.time()
+                if nowc - last_item_clarification_at.get(room_id, 0) > 90:
+                    last_item_clarification_at[room_id] = nowc
+                    add_message(room_id, "Moderator", clar, "moderator")
+                    socketio.emit(
+                        "receive_message",
+                        chat_socket_payload("Moderator", clar),
+                        room=room_id,
+                    )
+                    log_moderator_intervention(room_id, "item_clarification", sender)
+        except Exception as clar_ex:
+            logger.debug(f"Item clarification skipped: {clar_ex}")
+
         logger.info(f"✅ Message sent to room {room_id}")
 
     except Exception as e:
@@ -1758,8 +1905,10 @@ def handle_end_session(data):
             # Add ranking accuracy if available
             if room.get('final_ranking'):
                 from data_retriever import compare_with_expert_ranking
+
                 ranking = json.loads(room.get('final_ranking'))
-                comparison = compare_with_expert_ranking(ranking)
+                td = get_room_task_data(room_id) or get_data()
+                comparison = compare_with_expert_ranking(ranking, td)
                 metrics_data["ranking_accuracy"] = comparison['accuracy_percentage']
             
             # Add time to consensus if available

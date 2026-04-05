@@ -2,13 +2,14 @@
 # 📦 data_retriever.py — ENHANCED DESERT SURVIVAL SCENARIOS
 # ============================================================
 from __future__ import annotations
+import hashlib
 import os
 import re
 import html
 import json
 import logging
 import random
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 logger = logging.getLogger("moderator-data")
 
@@ -379,3 +380,124 @@ def get_random_scenario() -> Dict[str, Any]:
 def list_scenarios() -> Dict[str, str]:
     """Return a dictionary of scenario keys and names"""
     return {key: scenario["task_name"] for key, scenario in ALL_SCENARIOS.items()}
+
+
+# ============================================================
+# Room-pinned task data (single source of truth per session)
+# ============================================================
+ROOM_TASK_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def resolve_task_data_from_room(room: Optional[dict]) -> Dict[str, Any]:
+    """Map a Supabase room row to the exact scenario dict (stable item strings)."""
+    if not room:
+        return get_data()
+    sid = (room.get("story_id") or "").strip()
+    if sid in ALL_SCENARIOS:
+        return ALL_SCENARIOS[sid]
+    for _key, scen in ALL_SCENARIOS.items():
+        if scen.get("task_id") == sid:
+            return scen
+    low = sid.lower()
+    if "plane" in low or "crash" in low:
+        return ALL_SCENARIOS["plane_crash"]
+    if "hiker" in low or "lost" in low:
+        return ALL_SCENARIOS["lost_hikers"]
+    if "vehicle" in low or "suv" in low or "car" in low:
+        return ALL_SCENARIOS["broken_vehicle"]
+    # default-story / missing: deterministic per room id so all clients match
+    rid = (room.get("id") or "unknown").encode("utf-8")
+    idx = int(hashlib.md5(rid).hexdigest(), 16) % len(ALL_SCENARIOS)
+    key = sorted(ALL_SCENARIOS.keys())[idx]
+    return ALL_SCENARIOS[key]
+
+
+def pin_task_data_for_room(room_id: str, task_data: Dict[str, Any]) -> None:
+    ROOM_TASK_CACHE[room_id] = task_data
+
+
+def get_pinned_or_resolve_task_data(room_id: str) -> Dict[str, Any]:
+    if room_id in ROOM_TASK_CACHE:
+        return ROOM_TASK_CACHE[room_id]
+    try:
+        from supabase_client import get_room
+
+        room = get_room(room_id)
+        td = resolve_task_data_from_room(room)
+    except Exception as exc:
+        logger.warning("Could not resolve task for room %s: %s", room_id, exc)
+        td = get_data()
+    ROOM_TASK_CACHE[room_id] = td
+    return td
+
+
+def get_canonical_items_for_room(room_id: str) -> Dict[str, Any]:
+    """Identical item list + metadata for every client tied to this room."""
+    td = get_pinned_or_resolve_task_data(room_id)
+    return {
+        "items": list(td.get("items", [])),
+        "task_name": td.get("task_name", "Desert Survival"),
+        "task_id": td.get("task_id", ""),
+    }
+
+
+# (alias substring, required keywords in canonical line — all must appear in lowercased item text)
+_ITEM_ALIAS_QUERIES: List[Tuple[Tuple[str, ...], Tuple[str, ...]]] = [
+    (("compact mirror", "small mirror", "visor mirror"), ("mirror",)),
+    (("cosmetic mirror",), ("mirror", "cosmetic")),
+    (("space blanket", "emergency blanket", "mylar"), ("blanket", "sheet")),
+    (("tarp", "orange tarp"), ("tarp",)),
+    (("plastic sheet", "large plastic"), ("plastic", "sheet")),
+    (("salt packet", "salt tab", "bp tablet"), ("salt",)),
+    (("multi-tool", "multitool", "leatherman"), ("multi-tool", "tool")),
+    (("hunting knife", "pocket knife"), ("knife",)),
+    (
+        ("winter coat", "hoodie", "windbreaker", "jacket"),
+        ("coat", "jacket", "windbreaker", "hoodie"),
+    ),
+    (("matches",), ("match",)),
+    (("lighter",), ("lighter",)),
+    (("parachute", "chute"), ("parachute",)),
+    (("field guide", "edible animals", "survival guide"), ("book", "guide")),
+    (("road map", "topo", "topographic"), ("map",)),
+]
+
+
+def normalize_item_name(user_phrase: str, canonical_items: List[str]) -> Optional[str]:
+    """Map a user fragment to the exact scenario string when unambiguous."""
+    if not user_phrase or not canonical_items:
+        return None
+    low = user_phrase.lower().strip()
+    for aliases, need in _ITEM_ALIAS_QUERIES:
+        if not any(a in low for a in aliases):
+            continue
+        candidates = [c for c in canonical_items if all(k in c.lower() for k in need)]
+        if len(candidates) == 1:
+            return candidates[0]
+    best: Optional[str] = None
+    best_len = 0
+    for c in canonical_items:
+        cl = c.lower()
+        if len(cl) > 6 and cl in low:
+            if len(cl) > best_len:
+                best_len = len(cl)
+                best = c
+    return best
+
+
+def clarify_alias_against_list(message: str, canonical_items: List[str]) -> Optional[str]:
+    """If the message uses a known alias but not the official list wording, return one short line."""
+    if not message or not canonical_items:
+        return None
+    ml = message.lower()
+    for aliases, need in _ITEM_ALIAS_QUERIES:
+        if not any(a in ml for a in aliases):
+            continue
+        candidates = [c for c in canonical_items if all(k in c.lower() for k in need)]
+        if len(candidates) != 1:
+            continue
+        canon = candidates[0]
+        if canon.lower()[:12] in ml:
+            return None
+        return f"Quick note: on **our list** that item is: **{canon}**."
+    return None

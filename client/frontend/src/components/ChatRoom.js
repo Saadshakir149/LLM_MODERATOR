@@ -191,21 +191,41 @@ export default function ChatRoom() {
   const messagesEndRef = useRef(null);
 
   useEffect(() => {
+    if (!roomId) return undefined;
     let cancelled = false;
-    fetch(`${API_BASE}/api/desert-items`)
+    const q = encodeURIComponent(roomId);
+    fetch(`${API_BASE}/api/desert-items?room_id=${q}`)
       .then((res) => (res.ok ? res.json() : Promise.reject(new Error(res.statusText))))
       .then((data) => {
         if (!cancelled && Array.isArray(data.items) && data.items.length > 0) {
           setDesertItems(data.items);
+          try {
+            sessionStorage.setItem(`room_${roomId}_items`, JSON.stringify(data.items));
+          } catch (_) {
+            /* ignore quota / private mode */
+          }
         }
       })
       .catch(() => {
-        if (!cancelled) setDesertItems([...DESERT_ITEMS]);
+        if (cancelled) return;
+        try {
+          const cached = sessionStorage.getItem(`room_${roomId}_items`);
+          if (cached) {
+            const parsed = JSON.parse(cached);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              setDesertItems(parsed);
+              return;
+            }
+          }
+        } catch (_) {
+          /* ignore */
+        }
+        setDesertItems([...DESERT_ITEMS]);
       });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [roomId]);
 
   const dismissLanguageWarning = useCallback(() => {
     if (languageWarningTimerRef.current) {
