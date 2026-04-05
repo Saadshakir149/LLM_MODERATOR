@@ -10,6 +10,7 @@ import time
 import logging
 import random
 import traceback
+from difflib import SequenceMatcher
 from dotenv import load_dotenv
 
 # ============================================================
@@ -17,6 +18,303 @@ from dotenv import load_dotenv
 # ============================================================
 load_dotenv()
 logger = logging.getLogger("moderator-prompts")
+
+# Capitalized tokens in moderator replies that are not participant names (avoid false "fake name" blocks).
+_ACTIVE_MODERATOR_ALLOWED_CAP_WORDS: frozenset[str] = frozenset(
+    {
+        "I",
+        "We",
+        "You",
+        "They",
+        "He",
+        "She",
+        "It",
+        "The",
+        "This",
+        "That",
+        "These",
+        "Those",
+        "Let",
+        "Lets",
+        "Let's",
+        "We'd",
+        "We'll",
+        "We're",
+        "We've",
+        "You'd",
+        "You'll",
+        "You're",
+        "You've",
+        "They'd",
+        "They'll",
+        "They're",
+        "They've",
+        "It's",
+        "That's",
+        "What's",
+        "Who's",
+        "Here's",
+        "There's",
+        "Id",
+        "Ill",
+        "Im",
+        "Ive",
+        "Please",
+        "Thanks",
+        "Thank",
+        "Good",
+        "Great",
+        "Awesome",
+        "Interesting",
+        "What",
+        "How",
+        "Why",
+        "When",
+        "Where",
+        "Which",
+        "Who",
+        "Whom",
+        "Next",
+        "Start",
+        "Begin",
+        "Think",
+        "Thought",
+        "Help",
+        "Question",
+        "Answer",
+        "Point",
+        "Idea",
+        "Agree",
+        "Disagree",
+        "Hello",
+        "Hi",
+        "Hey",
+        "Welcome",
+        "Everyone",
+        "All",
+        "Some",
+        "Most",
+        "Few",
+        "Many",
+        "Both",
+        "Each",
+        "Every",
+        "First",
+        "Second",
+        "Third",
+        "Last",
+        "Final",
+        "Important",
+        "Critical",
+        "Water",
+        "Desert",
+        "Survival",
+        "Item",
+        "Items",
+        "Rank",
+        "Ranking",
+        "Mirror",
+        "Flashlight",
+        "Knife",
+        "Parachute",
+        "Compass",
+        "Map",
+        "Matches",
+        "Coat",
+        "Plastic",
+        "Sheet",
+        "Book",
+        "Salt",
+        "Tablets",
+        "Bottle",
+        "Student",
+        "Students",
+        "Group",
+        "Team",
+        "Now",
+        "But",
+        "Then",
+        "So",
+        "And",
+        "Or",
+        "For",
+        "Nor",
+        "Yet",
+        "However",
+        "Therefore",
+        "Thus",
+        "Maybe",
+        "Perhaps",
+        "Still",
+        "Actually",
+        "Also",
+        "Even",
+        "Well",
+        "Okay",
+        "Ok",
+        "Yes",
+        "No",
+        "Sure",
+        "Really",
+        "Very",
+        "Just",
+        "Only",
+        "One",
+        "Two",
+        "Three",
+        "Four",
+        "Five",
+        "Six",
+        "Seven",
+        "Eight",
+        "Nine",
+        "Ten",
+        "Eleven",
+        "Twelve",
+        "About",
+        "Almost",
+        "Already",
+        "Again",
+        "Quite",
+        "Rather",
+        "Pretty",
+        "Such",
+        "Much",
+        "More",
+        "Mostly",
+        "Less",
+        "Least",
+        "Best",
+        "Better",
+        "Worst",
+        "Other",
+        "Others",
+        "Another",
+        "Someone",
+        "Something",
+        "Nothing",
+        "Anything",
+        "Anyway",
+        "Because",
+        "Since",
+        "While",
+        "During",
+        "Before",
+        "After",
+        "Until",
+        "Once",
+        "Here",
+        "There",
+        "Wherever",
+        "Today",
+        "Tonight",
+        "Remember",
+        "Quick",
+        "Quickly",
+        "Sounds",
+        "Looks",
+        "Seems",
+        "Keep",
+        "Stay",
+        "Doing",
+        "Done",
+        "Being",
+        "Been",
+        "Having",
+        "Doing",
+        "Make",
+        "Made",
+        "Need",
+        "Needs",
+        "Want",
+        "Wants",
+        "Like",
+        "Love",
+        "Going",
+        "Come",
+        "Coming",
+        "Back",
+        "Over",
+        "Under",
+        "Between",
+        "Among",
+        "Without",
+        "Within",
+        "Across",
+        "Around",
+        "Toward",
+        "Towards",
+        "Especially",
+        "Probably",
+        "Certainly",
+        "Definitely",
+        "Obviously",
+        "Basically",
+        "Generally",
+        "Usually",
+        "Sometimes",
+        "Often",
+        "Never",
+        "Always",
+        "Already",
+        "Together",
+        "Everyone",
+        "Somebody",
+        "Nobody",
+        "Anyone",
+        "Moderator",
+        "Signal",
+        "Signaling",
+        "Rescue",
+        "Shade",
+        "Shelter",
+        "Fire",
+        "Food",
+        "Besides",
+        "Plus",
+        "Finally",
+        "Meanwhile",
+        "Instead",
+        "Either",
+        "Neither",
+    }
+)
+
+_ACTIVE_MODERATOR_ALLOWED_LOWER: frozenset[str] = frozenset(
+    w.lower() for w in _ACTIVE_MODERATOR_ALLOWED_CAP_WORDS
+)
+
+
+def _normalize_active_moderator_name_token(raw: str) -> str:
+    w = raw.strip('.,!?\"()[]{}:;—–')
+    w = re.sub(r"^\*+\s*|\s*\*+$", "", w)
+    w = re.sub(r"(['’]s)$", "", w, flags=re.IGNORECASE)
+    w = w.strip()
+    if w.startswith("@"):
+        w = w[1:].strip()
+    return w.strip()
+
+
+def _active_moderator_token_matches_participant(
+    token: str, actual_participants: List[str]
+) -> bool:
+    """Match display tokens to enrolled names (possessives, small typos)."""
+    bare = _normalize_active_moderator_name_token(token)
+    if not bare:
+        return False
+    for p in actual_participants:
+        pb = _normalize_active_moderator_name_token(p)
+        if not pb:
+            continue
+        if bare == pb or bare.lower() == pb.lower():
+            return True
+        lo_b, lo_p = bare.lower(), pb.lower()
+        n = max(len(bare), len(pb))
+        thr = 0.82 if (n >= 6 or "_" in bare or "_" in pb) else 0.86
+        if n >= 5 and SequenceMatcher(None, lo_b, lo_p).ratio() >= thr:
+            return True
+    return False
+
 
 # ============================================================
 # ⚙️ Config Loader
@@ -946,35 +1244,37 @@ ONLY use these participant names: {participant_list_str}"""
             # Remove any "Moderator:" prefix if present
             text = re.sub(r"^\s*Moderator[:\-–]?\s*", "", text)
             
-            # Final check: ensure no fake names are used
+            # Block only likely hallucinated *participant* names. Stay conservative about
+            # discarding Groq output: digits/underscores → anon usernames; allowlist + fuzzy match.
             words = text.split()
             fake_name_detected = False
+            participant_lower = {p.lower() for p in actual_participants if p}
             for word in words:
-                clean_word = word.strip('.,!?\'"()[]{}')
-                if clean_word and clean_word[0].isupper() and clean_word not in actual_participants:
-                    # Comprehensive list of common English words
-                    common_words = [
-                        'I', 'We', 'You', 'They', 'He', 'She', 'It', 'The', 'This', 'That', 'These', 'Those',
-                        'Let', 'Let\'s', 'Lets', 'Id', 'I\'d', 'Ill', 'I\'ll', 'Im', 'I\'m', 'Ive', 'I\'ve',
-                        'We\'re', 'We\'ll', 'We\'ve', 'We\'d', 'You\'re', 'You\'ll', 'You\'ve', 'You\'d',
-                        # Conjunctions / pronouns at sentence start (avoid false "fake name" on e.g. "But ...")
-                        'But', 'And', 'Or', 'For', 'Nor', 'Yet', 'So',
-                        'Please', 'Thanks', 'Thank', 'Good', 'Great', 'Awesome', 'Interesting',
-                        'What', 'How', 'Why', 'When', 'Where', 'Which', 'Who', 'Whom',
-                        'Next', 'Start', 'Begin', 'Think', 'Thought', 'Help', 'Question', 'Answer',
-                        'Point', 'Idea', 'Agree', 'Disagree', 'Hello', 'Hi', 'Hey', 'Welcome',
-                        'Everyone', 'All', 'Some', 'Most', 'Few', 'Many', 'Both', 'Each', 'Every',
-                        'First', 'Second', 'Third', 'Last', 'Final', 'Important', 'Critical',
-                        'Water', 'Desert', 'Survival', 'Item', 'Items', 'Rank', 'Ranking',
-                        'Mirror', 'Flashlight', 'Knife', 'Parachute', 'Compass', 'Map', 'Matches',
-                        'Coat', 'Plastic', 'Sheet', 'Book', 'Salt', 'Tablets', 'Bottle',
-                        'Student', 'Students', 'Group', 'Team', 'Everyone'
-                    ]
-                    if clean_word not in common_words and len(clean_word) > 2:
-                        logger.warning(f"⚠️ Detected potential fake name '{clean_word}', using fallback")
-                        fake_name_detected = True
-                        break
-            
+                clean_word = _normalize_active_moderator_name_token(word)
+                if not clean_word or not clean_word[0].isupper():
+                    continue
+                if len(clean_word) <= 2:
+                    continue
+                if clean_word in actual_participants:
+                    continue
+                if clean_word.lower() in participant_lower:
+                    continue
+                # student_123 / Studeent_4460-style tokens; never treat as random Title Case words
+                if re.search(r"[0-9_]", clean_word):
+                    continue
+                if clean_word.lower() in _ACTIVE_MODERATOR_ALLOWED_LOWER:
+                    continue
+                if _active_moderator_token_matches_participant(clean_word, actual_participants):
+                    continue
+                # Short all-caps tokens are usually emphasis, not invented people
+                if clean_word.isupper() and len(clean_word) <= 5:
+                    continue
+                logger.warning(
+                    "⚠️ Possible fake name %r detected, using fallback", clean_word
+                )
+                fake_name_detected = True
+                break
+
             if fake_name_detected:
                 return _active_engaging_fallback(actual_participants, time_remaining)
             
