@@ -83,8 +83,11 @@ from supabase_client import (
 from research_metrics import (
     calculate_gini_coefficient,
     calculate_entropy,
-    analyze_participation,
     detect_conflict_episodes,
+    message_suggests_interpersonal_conflict,
+    recent_multispeaker_tension,
+    discussion_appears_off_task,
+    intervention_followup_seconds,
 )
 
 # ============================================================
@@ -108,7 +111,6 @@ from data_retriever import (
 # ============================================================
 from prompts import (
     generate_active_moderator_response,
-    generate_passive_moderator_response,
     generate_personalized_feedback,
     get_random_ending,
     check_inappropriate_language,
@@ -822,6 +824,8 @@ def start_active_moderator(room_id: str):
                         "statement_attribution": {},
                         "last_attr_msg_id": None,
                         "last_turn_balance_msg_id": None,
+                        "last_conflict_deescalation_id": None,
+                        "last_drift_nudge_time": 0.0,
                     },
                 )
 
@@ -864,6 +868,64 @@ def start_active_moderator(room_id: str):
                         )
                         aux["last_turn_balance_msg_id"] = last_mid
                         last_intervention_time = now
+
+                # RQ2: Tone / conflict de-escalation (fast, <~1 min after tense exchange)
+                last_stu = next(
+                    (
+                        m
+                        for m in reversed(messages)
+                        if m.get("username") not in ("Moderator", "System", None, "")
+                    ),
+                    None,
+                )
+                if last_stu and now - last_intervention_time > 50:
+                    mid_c = str(last_stu.get("id", ""))
+                    tense = message_suggests_interpersonal_conflict(
+                        last_stu.get("message", "")
+                    ) or recent_multispeaker_tension(messages)
+                    if tense and mid_c and mid_c != str(
+                        aux.get("last_conflict_deescalation_id") or ""
+                    ):
+                        aux["last_conflict_deescalation_id"] = mid_c
+                        line = enforce_response_length(
+                            "I'm hearing some friction—let's keep this respectful and collaborative. "
+                            "Can each of you offer **one** concrete change to your **12-item** ranking?",
+                            55,
+                        )
+                        add_message(room_id, "Moderator", line, "moderator")
+                        socketio.emit(
+                            "receive_message",
+                            chat_socket_payload("Moderator", line),
+                            room=room_id,
+                        )
+                        log_moderator_intervention(
+                            room_id,
+                            "conflict_resolution",
+                            last_stu.get("username"),
+                        )
+                        last_intervention_time = now
+
+                # RQ4: Refocus when chat drifts off ranking / items (at most ~every 2 min)
+                if (
+                    time_elapsed >= 4
+                    and discussion_appears_off_task(messages, canonical_items)
+                    and now - float(aux.get("last_drift_nudge_time") or 0) > 120
+                    and now - last_intervention_time > 55
+                ):
+                    aux["last_drift_nudge_time"] = now
+                    line = enforce_response_length(
+                        "Quick refocus: you need **one agreed order for all 12 desert items** (1 = most important). "
+                        "Which position is the group most uncertain about?",
+                        50,
+                    )
+                    add_message(room_id, "Moderator", line, "moderator")
+                    socketio.emit(
+                        "receive_message",
+                        chat_socket_payload("Moderator", line),
+                        room=room_id,
+                    )
+                    log_moderator_intervention(room_id, "discussion_drift", None)
+                    last_intervention_time = now
                 
                 # ===== ACTIVE MODERATOR RULES =====
                 
@@ -1195,7 +1257,7 @@ def start_passive_moderator(room_id: str):
     def monitor_loop():
         logger.info(f"🔴 PASSIVE moderator (minimal) for room {room_id}")
         intervention_count = 0
-        MAX_INTERVENTIONS = 3
+        MAX_INTERVENTIONS = 4  # passive research cap: @moderator replies + shared 5-min warning
         last_passive_handled_msg_id: Optional[str] = None
 
         while True:
@@ -1379,20 +1441,7 @@ def handle_submit_ranking(data):
         td = get_room_task_data(room_id) or get_data()
         comparison = compare_with_expert_ranking(ranking, td)
         logger.info(f"📈 Ranking accuracy: {comparison['accuracy_percentage']:.1f}%")
-        
-        # Save metrics
-        metrics = analyze_participation(room_id, get_chat_history(room_id))
-        if metrics:
-            supabase.table("research_metrics").insert({
-                "room_id": room_id,
-                "gini_coefficient": metrics['gini_coefficient'],
-                "max_share": metrics['max_share'],
-                "min_share": metrics['min_share'],
-                "dominance_gap": metrics['dominance_gap'],
-                "total_messages": metrics['total_messages'],
-                "ranking_accuracy": comparison['accuracy_percentage'],
-                "created_at": datetime.now(timezone.utc).isoformat()
-            }).execute()
+        # RQ1–RQ5 room-level metrics are persisted in handle_end_session (single canonical row + participant_metrics)
         
         # Send confirmation
         socketio.emit("ranking_submitted", {
@@ -1761,6 +1810,20 @@ def send_message_handler(data):
                 room=room_id,
             )
             logger.info(f"✅ Flagged message from {sender} broadcast (severity={severity})")
+
+            if severity == "HIGH":
+                resolution = enforce_response_length(
+                    "Let's reset tone and refocus on collaboration—which **item** in your **12-item list** "
+                    "should the group settle next, and why?",
+                    45,
+                )
+                add_message(room_id, "Moderator", resolution, "moderator")
+                socketio.emit(
+                    "receive_message",
+                    chat_socket_payload("Moderator", resolution),
+                    room=room_id,
+                )
+                log_moderator_intervention(room_id, "conflict_resolution", sender)
             return
 
         saved_chat = add_message(
@@ -1977,6 +2040,20 @@ def handle_end_session(data):
                 analyze_conflict_episodes(room_id)
             except Exception as ex:
                 logger.debug(f"Optional conflict_episodes persistence skipped: {ex}")
+
+            try:
+                inv_r = (
+                    supabase.table("moderator_interventions")
+                    .select("*")
+                    .eq("room_id", room_id)
+                    .execute()
+                )
+                rq5 = intervention_followup_seconds(
+                    inv_r.data or [], full_chat_history, window_sec=180.0
+                )
+                logger.info("RQ5 intervention→student follow-up: %s", rq5)
+            except Exception as rq5e:
+                logger.debug("RQ5 latency summary skipped: %s", rq5e)
             
         except Exception as e:
             logger.error(f"❌ Failed to save research metrics: {e}")

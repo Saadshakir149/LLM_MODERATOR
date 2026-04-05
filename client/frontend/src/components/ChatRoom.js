@@ -47,19 +47,20 @@ const getUserColor = (userName, currentUserName) => {
 // ============================================================
 // 🏜️ DESERT SURVIVAL ITEMS (for ranking)
 // ============================================================
+// Fallback only — server sends the pinned list via /api/desert-items?room_id=
 const DESERT_ITEMS = [
-  "A flashlight (4 battery size)",
+  "A flashlight (4 batteries included)",
   "A map of the region",
   "A compass",
-  "A large plastic sheet",
+  "A large plastic sheet (6x8 feet)",
   "A box of matches",
   "A winter coat",
   "A bottle of salt tablets (1000 tablets)",
-  "A small knife",
-  "2 quarts of water per person",
+  "A small hunting knife",
+  "2 quarts of water per person (6 quarts total)",
   "A cosmetic mirror",
-  "A parachute (red & white)",
-  "A book - 'Edible Animals of the Desert'"
+  "A parachute (red & white, 30ft diameter)",
+  "A book - 'Edible Animals of the Desert'",
 ];
 
 const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:5000";

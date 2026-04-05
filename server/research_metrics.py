@@ -50,45 +50,53 @@ def calculate_entropy(shares: List[float]) -> float:
     max_entropy = math.log2(len(shares)) if shares else 1
     return entropy / max_entropy if max_entropy > 0 else 0
 
-def analyze_participation(room_id: str, messages: List[Dict]) -> Optional[Dict]:
+def analyze_participation(
+    room_id: str,
+    messages: List[Dict],
+    student_usernames: Optional[List[str]] = None,
+) -> Optional[Dict]:
     """
-    Calculate all participation metrics for a room
-    Returns dict with Gini, dominance, shares, etc.
+    RQ1/RQ3 participation metrics. If `student_usernames` is provided (enrolled triad),
+    includes zeros for silent members so Gini/entropy match end_session.
     """
     try:
-        # Count messages per user (excluding moderator)
-        user_counts = {}
-        for msg in messages:
-            username = msg.get('username')
-            if username and username != 'Moderator' and username != 'System':
-                user_counts[username] = user_counts.get(username, 0) + 1
-        
-        if len(user_counts) != 3:  # Should be exactly 3 participants
-            logger.warning(f"Room {room_id} has {len(user_counts)} participants, expected 3")
-            return None
-        
+        _skip = {"Moderator", "System", None, ""}
+        if student_usernames:
+            user_counts = {u: 0 for u in student_usernames if u not in _skip}
+            for msg in messages:
+                username = msg.get("username")
+                if username in user_counts:
+                    user_counts[username] = user_counts[username] + 1
+        else:
+            user_counts = {}
+            for msg in messages:
+                username = msg.get("username")
+                if username and username not in _skip:
+                    user_counts[username] = user_counts.get(username, 0) + 1
+            if not user_counts:
+                return None
+
         counts = list(user_counts.values())
         total = sum(counts)
-        
+
         if total == 0:
-            return None
-        
-        shares = [c/total for c in counts]
-        
-        # Calculate metrics
+            shares = [0.0 for _ in counts]
+        else:
+            shares = [c / total for c in counts]
+
         gini = calculate_gini_coefficient(shares)
         entropy = calculate_entropy(shares)
-        max_share = max(shares)
-        min_share = min(shares)
+        max_share = max(shares) if shares else 0.0
+        min_share = min(shares) if shares else 0.0
         dominance_gap = max_share - min_share
-        
-        # Identify dominant and quiet participants
+
         sorted_users = sorted(user_counts.items(), key=lambda x: x[1], reverse=True)
-        
+
         return {
             "room_id": room_id,
             "gini_coefficient": gini,
             "entropy": entropy,
+            "participation_entropy": entropy,
             "max_share": max_share,
             "min_share": min_share,
             "dominance_gap": dominance_gap,
@@ -96,12 +104,167 @@ def analyze_participation(room_id: str, messages: List[Dict]) -> Optional[Dict]:
             "total_messages": total,
             "dominant_user": sorted_users[0][0] if sorted_users else None,
             "quiet_user": sorted_users[-1][0] if sorted_users else None,
-            "shares": {user: share for user, share in zip(user_counts.keys(), shares)}
+            "shares": dict(zip(user_counts.keys(), shares)),
         }
-    
+
     except Exception as e:
         logger.error(f"Error analyzing participation: {e}")
         return None
+
+
+# Strong / interpersonal friction cues for proactive de-escalation (RQ2)
+STRONG_TONE_FRAGMENTS: tuple[str, ...] = (
+    "you're wrong",
+    "youre wrong",
+    "you are wrong",
+    "shut up",
+    "stupid",
+    "idiot",
+    "ridiculous",
+    "nonsense",
+    "useless",
+    "dumb",
+    "moron",
+    "not listening",
+    "you never",
+    "you always",
+)
+
+
+def message_suggests_interpersonal_conflict(text: str) -> bool:
+    if not text:
+        return False
+    low = text.lower()
+    return any(s in low for s in STRONG_TONE_FRAGMENTS)
+
+
+def recent_multispeaker_tension(
+    messages: List[Dict], *, lookback: int = 10
+) -> bool:
+    """True if recent window has conflict cues from 2+ different students (RQ2)."""
+    recent = messages[-lookback:] if messages else []
+    speakers = set()
+    for msg in recent:
+        u = msg.get("username")
+        if u in ("Moderator", "System", None, ""):
+            continue
+        if message_suggests_interpersonal_conflict(msg.get("message", "")):
+            speakers.add(u)
+        else:
+            hit = sum(1 for k in CONFLICT_KEYWORDS if k in (msg.get("message") or "").lower())
+            if hit >= 2:
+                speakers.add(u)
+    return len(speakers) >= 2
+
+
+def discussion_appears_off_task(
+    messages: List[Dict],
+    canonical_items: List[str],
+    *,
+    min_student_messages: int = 6,
+    lookback: int = 24,
+) -> bool:
+    """Heuristic: last student turns rarely reference items or ranking (RQ4 refocus)."""
+    recent = messages[-lookback:] if messages else []
+    student_msgs = [
+        m
+        for m in recent
+        if m.get("username") not in ("Moderator", "System", None, "")
+    ]
+    if len(student_msgs) < min_student_messages:
+        return False
+    blob = " ".join((m.get("message") or "").lower() for m in student_msgs[-min_student_messages :])
+    task_tokens = (
+        "rank",
+        "ranking",
+        "first",
+        "second",
+        "twelfth",
+        "12",
+        "item",
+        "list",
+        "order",
+        "priority",
+        "most important",
+        "least",
+        "consensus",
+        "agree",
+        "water",
+        "mirror",
+        "knife",
+        "compass",
+        "map",
+        "parachute",
+        "flashlight",
+    )
+    if any(t in blob for t in task_tokens):
+        return False
+    for item in canonical_items:
+        il = item.lower()
+        if len(il) >= 8 and il in blob:
+            return False
+    return True
+
+
+def intervention_followup_seconds(
+    interventions: List[Dict[str, Any]],
+    messages: List[Dict[str, Any]],
+    *,
+    window_sec: float = 180.0,
+) -> Dict[str, Any]:
+    """
+    RQ5: seconds until the next student message after each moderator intervention.
+    `interventions` rows need timestamps (ISO); messages need created_at.
+    """
+    from datetime import datetime as _dt
+
+    latencies: List[float] = []
+    per_type: Dict[str, List[float]] = {}
+
+    def _parse(ts: Any) -> Optional[_dt]:
+        if not ts:
+            return None
+        try:
+            if isinstance(ts, str):
+                return _dt.fromisoformat(ts.replace("Z", "+00:00"))
+        except Exception:
+            return None
+        return None
+
+    stud_msgs = [
+        m
+        for m in messages
+        if m.get("username") not in ("Moderator", "System", None, "")
+    ]
+
+    for inv in sorted(interventions or [], key=lambda x: x.get("timestamp") or ""):
+        t0 = _parse(inv.get("timestamp"))
+        if not t0:
+            continue
+        itype = str(inv.get("intervention_type") or "unknown")
+        next_t: Optional[_dt] = None
+        for m in stud_msgs:
+            t1 = _parse(m.get("created_at"))
+            if t1 and t1 > t0 and (t1 - t0).total_seconds() <= window_sec:
+                next_t = t1
+                break
+        if next_t is not None:
+            delta = (next_t - t0).total_seconds()
+            latencies.append(delta)
+            per_type.setdefault(itype, []).append(delta)
+
+    def _med(xs: List[float]) -> Optional[float]:
+        if not xs:
+            return None
+        s = sorted(xs)
+        mid = len(s) // 2
+        return float(s[mid]) if len(s) % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+    return {
+        "count_with_student_followup": len(latencies),
+        "median_latency_seconds": _med(latencies),
+        "by_type_median": {k: _med(v) for k, v in per_type.items()},
+    }
 
 # ============================================================
 # Conflict Detection
