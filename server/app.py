@@ -35,6 +35,7 @@ import threading
 import json
 import csv
 import random
+import re
 import traceback  # Add this line
 from io import BytesIO, StringIO
 from typing import Dict, List, Any, Optional, Set
@@ -227,11 +228,12 @@ def add_keep_alive_headers(response):
 active_monitors: Dict[str, threading.Thread] = {}
 room_sessions: Dict[str, str] = {}  # room_id -> session_id
 research_timers: Dict[str, threading.Thread] = {}  # room_id -> timer thread
+# Wall-clock zero for the 15-minute research block (set when task goes active, not room creation)
+room_research_session_started_at: Dict[str, float] = {}
 room_last_expert_tip: Dict[str, float] = {}
 room_expert_tip_message_key: Dict[str, str] = {}
 room_active_moderator_aux: Dict[str, Dict[str, Any]] = {}
 last_item_clarification_at: Dict[str, float] = {}
-room_ranking_completion_hint_at: Dict[str, float] = {}
 # One 5-min and one 1-min warning per room across timer + active + passive threads
 room_time_warning_5min_claimed: Dict[str, bool] = {}
 room_time_warning_1min_claimed: Dict[str, bool] = {}
@@ -277,6 +279,12 @@ _ACTIVE_FOLLOWUP_LINES = (
     "{name}, checking in: any item you want to push back on?",
 )
 
+_ACTIVE_FOLLOWUP_DEEP_LINES = (
+    "{name}, we value your input—what's at least one item you'd put near the top?",
+    "{name}, even a single priority (e.g. “1. water”) helps lock the ranking.",
+    "{name}, quick check: which item feels most urgent for survival to you?",
+)
+
 
 def _pick_phrase(templates: tuple, name: str) -> str:
     return random.choice(templates).format(name=name)
@@ -299,6 +307,26 @@ def _room_minutes_elapsed(room: Dict[str, Any], now: Optional[float] = None) -> 
     except Exception:
         pass
     return 0
+
+
+def _research_session_minutes_elapsed(
+    room_id: str, room: Dict[str, Any], now: Optional[float] = None
+) -> int:
+    """Minutes since the research block started (3 participants ready), not room creation."""
+    if now is None:
+        now = time.time()
+    start = room_research_session_started_at.get(room_id)
+    if start is not None:
+        return max(0, int((now - float(start)) / 60))
+    return _room_minutes_elapsed(room, now)
+
+
+def _session_start_timestamp(room_id: str, room: Optional[Dict[str, Any]]) -> float:
+    """Unix time for silence idle baseline (task start if known, else room creation)."""
+    st = room_research_session_started_at.get(room_id)
+    if st is not None:
+        return float(st)
+    return _room_created_timestamp(room)
 
 
 def collect_discussed_canonical_items(
@@ -502,33 +530,18 @@ GROQ_MAX_TOKENS = get_setting_value("GROQ_MAX_TOKENS", 2000)
 
 # Research settings - FROM YOUR EXPERIMENT DESIGN
 SILENCE_THRESHOLD_SECONDS = 90  # first silence invite (~1.5 min idle)
-SILENCE_FOLLOWUP_SECONDS = 150  # follow-up if still quiet after first invite (~2.5 min idle)
+SILENCE_FOLLOWUP_SECONDS = 180  # second nudge (~3 min idle after task start / last message)
+SILENCE_FOLLOWUP_THIRD_SECONDS = 270  # third nudge (~4.5 min idle)
 SILENCE_REINVITE_GAP_SECONDS = 90  # min gap between silence nudges to same person
 DOMINANCE_THRESHOLD = 0.5  # 50% of recent messages - if one person contributes >50%, balance
 TIME_WARNING_MINUTES = 5  # Warn when 5 minutes remaining
 
-# Participant chat hints → open ranking UI (RQ4); substring match on lowercased message
-RANKING_COMPLETION_HINT_PHRASES: tuple[str, ...] = (
-    "i m done",
-    "i'm done",
-    "im done",
-    "i am done",
-    "i have ranked",
-    "i ranked all",
-    "done ranking",
-    "finished ranking",
-    "finished the ranking",
-    "my ranking is",
-    "we are done",
-    "we're done",
-    "were done ranking",
-)
-
 logger.info(f"📝 Config: LLM Provider={LLM_PROVIDER}, Model={GROQ_MODEL}")
 logger.info(
-    "📝 Research Settings: Silence=%ss followup=%ss, Dominance=%s%%",
+    "📝 Research Settings: Silence=%ss followup=%ss third=%ss Dominance=%s%%",
     SILENCE_THRESHOLD_SECONDS,
     SILENCE_FOLLOWUP_SECONDS,
+    SILENCE_FOLLOWUP_THIRD_SECONDS,
     int(DOMINANCE_THRESHOLD * 100),
 )
 logger.info(f"📝 Frontend URL: {FRONTEND_URL}")
@@ -685,20 +698,167 @@ def get_room_task_data(room_id: str) -> Optional[Dict[str, Any]]:
         return None
     return get_pinned_or_resolve_task_data(room_id)
 
+
+# ============================================================
+# Auto-ranking from chat (RQ4 — no UI submission)
+# ============================================================
+_RANK_CHAT_LINE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:^|\n)\s*(\d{1,2})\s*[\.\)]\s*([^\n]+)", re.MULTILINE),
+    re.compile(
+        r"(?:^|\n)\s*(\d{1,2})(?:st|nd|rd|th)\b\s*[:=\-]?\s*([^\n]+)",
+        re.MULTILINE | re.IGNORECASE,
+    ),
+)
+
+
+def _match_fragment_to_canonical(
+    fragment: str, canonical_items: List[str]
+) -> Optional[str]:
+    frag = " ".join((fragment or "").split())
+    if len(frag) < 2:
+        return None
+    fl = frag.lower()
+    for c in canonical_items:
+        if c.lower() == fl:
+            return c
+    loose = [
+        c
+        for c in canonical_items
+        if fl in c.lower() or c.lower() in fl
+    ]
+    if len(loose) == 1:
+        return loose[0]
+    return None
+
+
+def _collect_rank_slots_from_chat(
+    room_id: str, canonical: List[str]
+) -> Dict[int, str]:
+    """Map rank 1..N → canonical item (later chat wins)."""
+    slots: Dict[int, str] = {}
+    if not canonical:
+        return slots
+    n = len(canonical)
+    messages = get_chat_history(room_id, limit=400)
+    for msg in messages:
+        u = msg.get("username")
+        if u in ("Moderator", "System", None, ""):
+            continue
+        text = msg.get("message") or ""
+        for pat in _RANK_CHAT_LINE_PATTERNS:
+            for m in pat.finditer(text):
+                try:
+                    r = int(m.group(1))
+                except (TypeError, ValueError):
+                    continue
+                if r < 1 or r > n:
+                    continue
+                raw = (m.group(2) or "").strip()
+                raw = re.split(r"[\n;•]", raw, maxsplit=1)[0].strip()
+                canon = _match_fragment_to_canonical(raw, canonical)
+                if canon:
+                    slots[r] = canon
+    return slots
+
+
+def extract_ranking_strict_from_chat(room_id: str) -> Optional[List[str]]:
+    """Full ranking only if chat supplies 1..N with N unique canonical items."""
+    td = get_pinned_or_resolve_task_data(room_id)
+    canonical = get_task_items(td) or []
+    if len(canonical) < 2:
+        return None
+    n = len(canonical)
+    slots = _collect_rank_slots_from_chat(room_id, canonical)
+    if len(slots) < n:
+        return None
+    for r in range(1, n + 1):
+        if r not in slots:
+            return None
+    ordered = [slots[r] for r in range(1, n + 1)]
+    if len(set(ordered)) != n:
+        return None
+    return ordered
+
+
+def extract_ranking_merged_from_chat(room_id: str) -> Optional[List[str]]:
+    """Merge explicit ranks from chat; fill gaps in canonical item-list order."""
+    td = get_pinned_or_resolve_task_data(room_id)
+    canonical = get_task_items(td) or []
+    if len(canonical) < 2:
+        return None
+    n = len(canonical)
+    slots = _collect_rank_slots_from_chat(room_id, canonical)
+    out: List[str] = []
+    used: Set[str] = set()
+    for r in range(1, n + 1):
+        c = slots.get(r)
+        if c and c in canonical and c not in used:
+            out.append(c)
+            used.add(c)
+        else:
+            nxt = next((x for x in canonical if x not in used), None)
+            if not nxt:
+                return None
+            out.append(nxt)
+            used.add(nxt)
+    return out if len(out) == n and len(used) == n else None
+
+
+def save_auto_ranking(room_id: str, ranking: List[str], source: str) -> bool:
+    try:
+        supabase.table("rooms").update(
+            {
+                "final_ranking": json.dumps(ranking),
+                "ranking_submitted_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ).eq("id", room_id).execute()
+        td = get_room_task_data(room_id) or get_data()
+        comparison = compare_with_expert_ranking(ranking, td)
+        logger.info(
+            "📋 Auto-ranking saved (%s) room=%s… accuracy=%.1f%%",
+            source,
+            room_id[:8],
+            float(comparison["accuracy_percentage"]),
+        )
+        socketio.emit(
+            "ranking_submitted",
+            {
+                "success": True,
+                "message": "Ranking recorded from chat",
+                "auto": True,
+            },
+            room=room_id,
+        )
+        return True
+    except Exception as e:
+        logger.error("❌ save_auto_ranking failed: %s", e, exc_info=True)
+        return False
+
+
 # ============================================================
 # RESEARCH TIMER - 15 Minute Session Timer
 # ============================================================
 def start_research_timer(room_id: str):
-    """15-minute session: 6m / 2m / 1m remaining warnings + force_ranking_modal, then auto end (RQ4)."""
+    """15 minutes from research start: milestone warnings, auto-ranking from chat, session end."""
+
+    existing = research_timers.get(room_id)
+    if existing is not None and existing.is_alive():
+        logger.warning(
+            "⏰ Research timer already running for room %s — not starting another",
+            room_id[:8],
+        )
+        return
 
     def timer_loop():
-        # t=9m elapsed → 6 minutes remaining
+        rid = room_id[:8]
+        logger.info("⏰ Timer thread started for room %s…", rid)
+        logger.info("⏰ Room %s…: sleep 9m → 6 min remaining warning", rid)
         time.sleep(9 * 60)
         room = get_room(room_id)
         if room and room.get("status") == "active":
+            logger.info("⏰ Room %s…: sending 6-min warning", rid)
             reminder = (
-                "⏰ **6 minutes remaining.** Keep working toward **one agreed ranking of all 12 items** "
-                "(1 = most important, 12 = least)."
+                "⏰ **6 minutes remaining!** Keep working toward **one agreed ranking of all 12 items**."
             )
             add_message(room_id, "Moderator", reminder, "system")
             socketio.emit(
@@ -707,12 +867,14 @@ def start_research_timer(room_id: str):
                 room=room_id,
             )
 
-        # t=13m → 2 minutes remaining
+        logger.info("⏰ Room %s…: sleep 4m → 2 min remaining + auto-rank attempt", rid)
         time.sleep(4 * 60)
         room = get_room(room_id)
         if room and room.get("status") == "active":
+            logger.info("⏰ Room %s…: 2-min milestone", rid)
             urgent = (
-                "⚠️ **2 minutes remaining!** Please **submit your final ranking of all 12 items** now."
+                "⚠️ **2 minutes remaining!** I'm **inferring a ranking from your chat**—use lines like "
+                "**`1. item`** … **`12. item`** with the official names when you can."
             )
             add_message(room_id, "Moderator", urgent, "system")
             socketio.emit(
@@ -720,21 +882,38 @@ def start_research_timer(room_id: str):
                 chat_socket_payload("Moderator", urgent),
                 room=room_id,
             )
-            try:
+            strict = extract_ranking_strict_from_chat(room_id)
+            if strict and save_auto_ranking(room_id, strict, "timer_2min_strict"):
+                ok = (
+                    "📋 **Final ranking inferred from your discussion.** Ending the session now—"
+                    "thank you."
+                )
+                add_message(room_id, "Moderator", ok, "system")
                 socketio.emit(
-                    "force_ranking_modal",
-                    {"room_id": room_id},
+                    "receive_message",
+                    chat_socket_payload("Moderator", ok),
                     room=room_id,
                 )
-            except Exception as e:
-                logger.warning("force_ranking_modal (2m) failed: %s", e)
+                time.sleep(3)
+                try:
+                    handle_end_session(
+                        {
+                            "room_id": room_id,
+                            "sender": "system",
+                            "reason": "auto_ranking",
+                        }
+                    )
+                except Exception as e:
+                    logger.error("Early handle_end_session after auto-rank: %s", e)
+                return
 
-        # t=14m → last minute
+        logger.info("⏰ Room %s…: sleep 1m → last minute", rid)
         time.sleep(1 * 60)
         room = get_room(room_id)
         if room and room.get("status") == "active":
+            logger.info("⏰ Room %s…: last-minute warning", rid)
             last_push = (
-                "⏰ **LAST MINUTE!** Submit your **final ranking of all 12 items** now."
+                "⏰ **LAST MINUTE!** The server will **save a ranking from your chat** when time expires."
             )
             add_message(room_id, "Moderator", last_push, "system")
             socketio.emit(
@@ -742,22 +921,23 @@ def start_research_timer(room_id: str):
                 chat_socket_payload("Moderator", last_push),
                 room=room_id,
             )
-            try:
-                socketio.emit(
-                    "force_ranking_modal",
-                    {"room_id": room_id},
-                    room=room_id,
-                )
-            except Exception as e:
-                logger.warning("force_ranking_modal (1m) failed: %s", e)
 
-        # t=15m → time's up
+        logger.info("⏰ Room %s…: sleep 1m → time's up", rid)
         time.sleep(1 * 60)
         room = get_room(room_id)
         if room and room.get("status") == "active":
-            final_msg = (
-                "⏰ **Time's up.** This session is ending—thank you for participating."
-            )
+            logger.info("⏰ Room %s…: time's up — merged ranking + end", rid)
+            merged = extract_ranking_merged_from_chat(room_id)
+            if not merged:
+                td_fallback = get_pinned_or_resolve_task_data(room_id)
+                fb = get_task_items(td_fallback) or get_task_items(get_data())
+                if len(fb) >= 2:
+                    merged = list(fb)
+            if merged:
+                save_auto_ranking(room_id, merged, "timer_end_merged")
+            else:
+                logger.error("⏰ Room %s…: could not build any ranking list", rid)
+            final_msg = "⏰ **Time's up!** Session ending. Thank you for participating."
             add_message(room_id, "Moderator", final_msg, "system")
             socketio.emit(
                 "receive_message",
@@ -766,16 +946,16 @@ def start_research_timer(room_id: str):
             )
             time.sleep(2)
             try:
-                handle_end_session({"room_id": room_id, "sender": "system"})
+                handle_end_session(
+                    {"room_id": room_id, "sender": "system", "reason": "time_expired"}
+                )
             except Exception as e:
                 logger.error("Auto handle_end_session failed: %s", e)
 
     thread = threading.Thread(target=timer_loop, daemon=True)
     thread.start()
     research_timers[room_id] = thread
-    logger.info(
-        f"⏰ Research timer started for room {room_id} (milestones: 6m/2m/1m left, RQ4)"
-    )
+    logger.info("⏰ Research timer registered for room %s (15m chain)", room_id[:8])
 
 # ============================================================
 # Helper: Start Task
@@ -813,6 +993,8 @@ def start_task_for_room(room_id: str):
 
         # Update room status
         update_room_status(room_id, 'active')
+        room_research_session_started_at[room_id] = time.time()
+        logger.info("⏰ Research session clock started for room %s", room_id[:8])
 
         # Create session
         session = create_session(
@@ -847,7 +1029,8 @@ def start_task_for_room(room_id: str):
                 room=room_id,
             )
 
-            # Start research timer
+            # Start research timer (15m from clock above — not room creation time)
+            logger.info("⏰ Calling start_research_timer for room %s", room_id[:8])
             start_research_timer(room_id)
 
             # Start appropriate moderator based on condition
@@ -878,6 +1061,7 @@ def start_active_moderator(room_id: str):
         # Per-user cooldown for silence invites (re-invite allowed after gap; avoids one-and-done bug)
         last_silent_invite_at: Dict[str, float] = {}
         silent_followup_sent: Set[str] = set()
+        silent_third_sent: Set[str] = set()
         # Track last time we sent a dominance message for each user
         last_dominance_message: Dict[str, float] = {}
         
@@ -892,22 +1076,7 @@ def start_active_moderator(room_id: str):
                 
                 now = time.time()
                 
-                # Parse created_at timestamp safely
-                time_elapsed = 0
-                created_at_val = room.get('created_at')
-                
-                if created_at_val:
-                    try:
-                        if isinstance(created_at_val, str):
-                            created_at_val = created_at_val.replace('Z', '+00:00')
-                            created_at_dt = datetime.fromisoformat(created_at_val)
-                            time_elapsed = int((now - created_at_dt.timestamp()) / 60)
-                        elif isinstance(created_at_val, (int, float)):
-                            time_elapsed = int((now - float(created_at_val)) / 60)
-                    except:
-                        time_elapsed = 0
-                
-                time_elapsed = max(0, time_elapsed)
+                time_elapsed = _research_session_minutes_elapsed(room_id, room, now)
                 time_remaining = max(0, 15 - time_elapsed)
                 
                 # Get recent messages for analysis
@@ -1113,32 +1282,63 @@ def start_active_moderator(room_id: str):
                 # RULE 2: Silence (2 min) + optional follow-up (3+ min idle after first ping)
                 if now - last_silence_check > 30:
                     silence_handled = False
-                    follow = check_silent_followup_candidate(
+                    deep = check_silent_third_candidate(
                         room_id,
                         participant_names,
                         last_silent_invite_at,
                         silent_followup_sent,
+                        silent_third_sent,
                         now,
                     )
                     if (
-                        follow
-                        and follow in participant_names
+                        deep
+                        and deep in participant_names
                         and (now - last_intervention_time > 45)
                     ):
-                        line_fu = _pick_phrase(_ACTIVE_FOLLOWUP_LINES, follow)
-                        add_message(room_id, "Moderator", line_fu, "moderator")
+                        line_d = _pick_phrase(_ACTIVE_FOLLOWUP_DEEP_LINES, deep)
+                        add_message(room_id, "Moderator", line_d, "moderator")
                         socketio.emit(
                             "receive_message",
-                            chat_socket_payload("Moderator", line_fu),
+                            chat_socket_payload("Moderator", line_d),
                             room=room_id,
                         )
                         log_moderator_intervention(
-                            room_id, "invite_silent_followup", follow
+                            room_id, "invite_silent_third", deep
                         )
-                        silent_followup_sent.add(follow)
+                        silent_third_sent.add(deep)
+                        last_silent_invite_at[deep] = now
                         last_intervention_time = now
                         silence_handled = True
-                        logger.info("✅ Silence follow-up to %s", follow)
+                        logger.info("✅ Silence third nudge to %s", deep)
+
+                    if not silence_handled:
+                        follow = check_silent_followup_candidate(
+                            room_id,
+                            participant_names,
+                            last_silent_invite_at,
+                            silent_followup_sent,
+                            now,
+                        )
+                        if (
+                            follow
+                            and follow in participant_names
+                            and (now - last_intervention_time > 45)
+                        ):
+                            line_fu = _pick_phrase(_ACTIVE_FOLLOWUP_LINES, follow)
+                            add_message(room_id, "Moderator", line_fu, "moderator")
+                            socketio.emit(
+                                "receive_message",
+                                chat_socket_payload("Moderator", line_fu),
+                                room=room_id,
+                            )
+                            log_moderator_intervention(
+                                room_id, "invite_silent_followup", follow
+                            )
+                            silent_followup_sent.add(follow)
+                            last_silent_invite_at[follow] = now
+                            last_intervention_time = now
+                            silence_handled = True
+                            logger.info("✅ Silence follow-up to %s", follow)
 
                     if not silence_handled:
                         silent_user = check_silence(room_id)
@@ -1264,7 +1464,8 @@ def start_active_moderator(room_id: str):
                     and claim_session_time_warning(room_id, "1")
                 ):
                     response = (
-                        "⏰ **Last minute!** Please submit your **full ranking of all 12 items** now."
+                        "⏰ **Last minute!** Keep your **`1.` … `12.`** lines in chat clear—the server records "
+                        "the ranking automatically at the end."
                     )
                     add_message(room_id, "Moderator", response, "moderator")
                     socketio.emit(
@@ -1275,14 +1476,6 @@ def start_active_moderator(room_id: str):
                     log_moderator_intervention(room_id, "time_warning_1m", None)
                     last_intervention_time = now
                     logger.info("✅ Sent 1-minute warning (active)")
-                    try:
-                        socketio.emit(
-                            "force_ranking_modal",
-                            {"room_id": room_id},
-                            room=room_id,
-                        )
-                    except Exception as fe:
-                        logger.warning("force_ranking_modal (1m active): %s", fe)
                 
                 # RULE 4: Answer questions about the task
                 if messages and len(messages) > 0:
@@ -1568,19 +1761,7 @@ def start_passive_moderator(room_id: str):
                     break
 
                 now = time.time()
-                time_elapsed = 0
-                created_at_val = room.get("created_at")
-                if created_at_val:
-                    try:
-                        if isinstance(created_at_val, str):
-                            cv = created_at_val.replace("Z", "+00:00")
-                            created_at_dt = datetime.fromisoformat(cv)
-                            time_elapsed = int((now - created_at_dt.timestamp()) / 60)
-                        elif isinstance(created_at_val, (int, float)):
-                            time_elapsed = int((now - float(created_at_val)) / 60)
-                    except Exception:
-                        time_elapsed = 0
-                time_elapsed = max(0, time_elapsed)
+                time_elapsed = _research_session_minutes_elapsed(room_id, room, now)
                 time_remaining = max(0, 15 - time_elapsed)
 
                 all_parts = get_participants(room_id)
@@ -1761,7 +1942,7 @@ def check_silence(room_id: str) -> Optional[str]:
     messages = get_chat_history(room_id, limit=500)
     now = time.time()
     room = get_room(room_id)
-    session_start = _room_created_timestamp(room)
+    session_start = _session_start_timestamp(room_id, room)
 
     last_student_msg_ts: Dict[str, float] = {}
     for msg in messages:
@@ -1802,14 +1983,14 @@ def check_silent_followup_candidate(
     now: float,
 ) -> Optional[str]:
     """
-    Second nudge: invited once, still idle ≥ SILENCE_FOLLOWUP_SECONDS (~2.5 min),
+    Second nudge: invited once, still idle ≥ SILENCE_FOLLOWUP_SECONDS (~3 min),
     ≥75s since last silence message to them, follow-up not yet sent.
     """
     if len(participant_names) < 3:
         return None
     messages = get_chat_history(room_id, limit=500)
     room = get_room(room_id)
-    session_start = _room_created_timestamp(room)
+    session_start = _session_start_timestamp(room_id, room)
     last_student_msg_ts: Dict[str, float] = {}
     for msg in messages:
         u = msg.get("username")
@@ -1834,6 +2015,51 @@ def check_silent_followup_candidate(
         last_ts = last_student_msg_ts.get(name)
         idle = (now - session_start) if last_ts is None else (now - last_ts)
         if idle < float(SILENCE_FOLLOWUP_SECONDS):
+            continue
+        if idle > best_idle:
+            best_idle = idle
+            best = name
+    return best
+
+
+def check_silent_third_candidate(
+    room_id: str,
+    participant_names: List[str],
+    last_invite_at: Dict[str, float],
+    followup_done: Set[str],
+    third_done: Set[str],
+    now: float,
+) -> Optional[str]:
+    """Third nudge: after second follow-up, still idle ≥ SILENCE_FOLLOWUP_THIRD_SECONDS."""
+    if len(participant_names) < 3:
+        return None
+    messages = get_chat_history(room_id, limit=500)
+    room = get_room(room_id)
+    session_start = _session_start_timestamp(room_id, room)
+    last_student_msg_ts: Dict[str, float] = {}
+    for msg in messages:
+        u = msg.get("username")
+        if u in ("Moderator", "System", None, ""):
+            continue
+        try:
+            ts = datetime.fromisoformat(
+                msg["created_at"].replace("Z", "+00:00")
+            ).timestamp()
+        except Exception:
+            continue
+        if u not in last_student_msg_ts or ts > last_student_msg_ts[u]:
+            last_student_msg_ts[u] = ts
+
+    best: Optional[str] = None
+    best_idle = -1.0
+    for name in participant_names:
+        if name not in followup_done or name in third_done:
+            continue
+        if now - last_invite_at.get(name, 0) < 75:
+            continue
+        last_ts = last_student_msg_ts.get(name)
+        idle = (now - session_start) if last_ts is None else (now - last_ts)
+        if idle < float(SILENCE_FOLLOWUP_THIRD_SECONDS):
             continue
         if idle > best_idle:
             best_idle = idle
@@ -2265,43 +2491,9 @@ def send_message_handler(data):
             room=room_id,
         )
 
-        msg_lower = msg.lower()
-        if any(p in msg_lower for p in RANKING_COMPLETION_HINT_PHRASES):
-            now_hint = time.time()
-            if now_hint - room_ranking_completion_hint_at.get(room_id, 0) >= 75:
-                room_ranking_completion_hint_at[room_id] = now_hint
-                reminder = (
-                    f"Thanks, {sender}. When your group is ready, please open the ranking window and "
-                    "click **Submit ranking** so your **final order of all 12 items** is saved."
-                )
-                add_message(room_id, "Moderator", reminder, "moderator")
-                socketio.emit(
-                    "receive_message",
-                    chat_socket_payload("Moderator", reminder),
-                    room=room_id,
-                )
-                try:
-                    socketio.emit(
-                        "force_ranking_modal",
-                        {"room_id": room_id},
-                        room=room_id,
-                    )
-                except Exception as r4e:
-                    logger.warning("force_ranking_modal (completion hint): %s", r4e)
-                log_moderator_intervention(room_id, "ranking_completion_hint", sender)
-            else:
-                try:
-                    socketio.emit(
-                        "force_ranking_modal",
-                        {"room_id": room_id},
-                        room=room_id,
-                    )
-                except Exception as r4e:
-                    logger.warning("force_ranking_modal (completion hint, cooldown): %s", r4e)
-
         if room.get("mode") == "active" and "@moderator" in msg.lower():
             try:
-                te = _room_minutes_elapsed(room)
+                te = _research_session_minutes_elapsed(room_id, room)
                 participants = get_participants(room_id)
                 participant_names = [
                     p["username"]
