@@ -15,7 +15,6 @@ import {
   MdCheck,
   MdPerson,
   MdChat,
-  MdDragHandle,
   MdCheckCircle,
   MdWarning
 } from "react-icons/md";
@@ -64,6 +63,64 @@ const DESERT_ITEMS = [
 ];
 
 const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:5000";
+
+function normalizeRankingToken(s) {
+  return String(s || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
+
+/** Parse numbered lines: "1. Foo", "1) Foo", or "1 Foo" */
+function parseRankingFromText(text) {
+  const items = [];
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    let m = t.match(/^\d+[.)]\s*(.+)$/);
+    if (m) {
+      items.push(m[1].trim());
+      continue;
+    }
+    m = t.match(/^\d+\s+(.+)$/);
+    if (m) items.push(m[1].trim());
+  }
+  return items;
+}
+
+/**
+ * Map free-text lines to canonical server item strings (exact, then loose single match).
+ */
+function resolveRankingToCanonical(parsed, canonicalList) {
+  const resolved = [];
+  const used = new Set();
+  for (const line of parsed) {
+    const n = normalizeRankingToken(line);
+    if (!n) {
+      return { error: "Remove empty lines or use Generate Template." };
+    }
+    let hit = canonicalList.find((c) => normalizeRankingToken(c) === n);
+    if (!hit) {
+      const loose = canonicalList.filter(
+        (c) =>
+          normalizeRankingToken(c).includes(n) ||
+          n.includes(normalizeRankingToken(c))
+      );
+      if (loose.length === 1) hit = loose[0];
+    }
+    if (!hit) {
+      return {
+        error: `Could not match “${line}” to an official item. Use Generate Template or copy labels from the Items panel.`,
+      };
+    }
+    if (used.has(hit)) {
+      return { error: `Each item must appear once. Duplicate: ${hit}` };
+    }
+    used.add(hit);
+    resolved.push(hit);
+  }
+  return { ranking: resolved };
+}
 
 const MARKDOWN_COMPONENTS = {
   p: ({ children, ...rest }) => (
@@ -181,8 +238,9 @@ export default function ChatRoom() {
   const [showRankingModal, setShowRankingModal] = useState(false);
   const [ranking, setRanking] = useState([]);
   const [rankingSubmitted, setRankingSubmitted] = useState(false);
+  const [rankingText, setRankingText] = useState("");
+  const [rankingError, setRankingError] = useState("");
   const [timeWarning, setTimeWarning] = useState(false);
-  const [draggedItem, setDraggedItem] = useState(null);
   const [languageWarning, setLanguageWarning] = useState(null);
   const languageWarningTimerRef = useRef(null);
   const processedIdsRef = useRef(new Set());
@@ -269,6 +327,12 @@ export default function ChatRoom() {
     return audio;
   });
 
+  const onForceRankingModal = useCallback((payload) => {
+    if (payload?.room_id && payload.room_id !== roomId) return;
+    setTimeWarning(true);
+    setShowRankingModal(true);
+  }, [roomId]);
+
   // ============================================================
   // ⚡ SOCKET CONNECTION & MESSAGES
   // ============================================================
@@ -321,13 +385,17 @@ export default function ChatRoom() {
     socket.on("receive_message", (data) => {
       console.log("📨 RECEIVED MESSAGE:", data);
 
-      if (
-        data?.sender === "Moderator" &&
-        typeof data.message === "string" &&
-        /5\s*minutes?\s*remaining/i.test(data.message)
-      ) {
-        setTimeWarning(true);
-        setShowRankingModal(true);
+      if (data?.sender === "Moderator" && typeof data.message === "string") {
+        const m = data.message;
+        if (
+          /5\s*minutes?\s*remaining/i.test(m) ||
+          /6\s*minutes?\s*remaining/i.test(m) ||
+          /2\s*minutes?\s*remaining/i.test(m) ||
+          /LAST\s+MINUTE/i.test(m)
+        ) {
+          setTimeWarning(true);
+          setShowRankingModal(true);
+        }
       }
 
       setMessages((prev) => {
@@ -405,6 +473,8 @@ export default function ChatRoom() {
       setShowRankingModal(true);
     });
 
+    socket.on("force_ranking_modal", onForceRankingModal);
+
     socket.on("ranking_submitted", (data) => {
       if (data.success) {
         setRankingSubmitted(true);
@@ -462,12 +532,13 @@ export default function ChatRoom() {
       socket.off("receive_message");
       socket.off("participants_update");
       socket.off("time_warning");
+      socket.off("force_ranking_modal", onForceRankingModal);
       socket.off("ranking_submitted");
       socket.off("session_ended");
       socket.off("language_warning", onLanguageWarningPayload);
       socket.off("warning_message", onLanguageWarningPayload);
     };
-  }, [roomId, userName, navigate, showLanguageWarningBanner]);
+  }, [roomId, userName, navigate, showLanguageWarningBanner, onForceRankingModal]);
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -512,48 +583,26 @@ export default function ChatRoom() {
   };
 
   // ============================================================
-  // 📊 RANKING INTERFACE HANDLERS
+  // 📊 RANKING (text list — canonical strings for analysis)
   // ============================================================
-  const handleDragStart = (e, index) => {
-    setDraggedItem(index);
-    e.dataTransfer.setData("text/plain", index);
-  };
-
-  const handleDragOver = (e) => {
-    e.preventDefault();
-  };
-
-  const handleDrop = (e, targetIndex) => {
-    e.preventDefault();
-    const sourceIndex = draggedItem;
-    if (sourceIndex === null || sourceIndex === targetIndex) return;
-
-    const newRanking = [...ranking];
-    const [movedItem] = newRanking.splice(sourceIndex, 1);
-    newRanking.splice(targetIndex, 0, movedItem);
-    setRanking(newRanking);
-    setDraggedItem(null);
-  };
-
-  const startRanking = () => {
-    setRanking([...DESERT_ITEMS]);
-  };
-
-  const resetRanking = () => {
-    setRanking([]);
-  };
-
-  const submitRanking = () => {
-    if (ranking.length !== 12) {
-      alert("Please rank all 12 items");
+  const validateAndSubmitRanking = useCallback(() => {
+    const parsed = parseRankingFromText(rankingText);
+    if (parsed.length !== 12) {
+      setRankingError(`Please rank all 12 items. You have ${parsed.length}/12 lines parsed.`);
       return;
     }
-
+    const { ranking: resolved, error } = resolveRankingToCanonical(parsed, desertItems);
+    if (error || !resolved || resolved.length !== 12) {
+      setRankingError(error || "Could not build a valid ranking.");
+      return;
+    }
+    setRankingError("");
+    setRanking(resolved);
     socket.emit("submit_ranking", {
       room_id: roomId,
-      ranking: ranking
+      ranking: resolved,
     });
-  };
+  }, [rankingText, desertItems, roomId]);
 
   // ============================================================
   // 🏁 END SESSION
@@ -574,93 +623,68 @@ export default function ChatRoom() {
         <div className="p-6">
           <div className="flex items-center justify-between mb-4">
             <h3 className="text-2xl font-bold text-gray-800">
-              {timeWarning ? "⏰ Time's Running Out!" : "Final Ranking"}
+              {timeWarning ? "⏰ Finalize your ranking" : "Final ranking"}
             </h3>
             {timeWarning && (
               <span className="px-3 py-1 bg-red-100 text-red-700 rounded-full text-sm font-semibold flex items-center gap-1">
-                <MdWarning /> ~5 min or less
+                <MdWarning /> Time limited
               </span>
             )}
           </div>
-          
+
           <p className="text-gray-600 mb-4">
-            Drag and drop items to rank them from <strong>1 (most important for survival)</strong> to{" "}
-            <strong>12 (least important)</strong>. Your group must agree on <strong>one final ranking of all 12 items</strong>{" "}
-            (every item appears exactly once).
+            Rank all 12 items from <strong>1 (most important)</strong> to <strong>12 (least important)</strong>.
+            One item per line, numbered. Use exact wording from the Items panel when possible so the submission saves
+            correctly.
           </p>
-          
-          {ranking.length === 0 ? (
-            <div className="space-y-2 mb-6">
-              {DESERT_ITEMS.map((item, index) => (
-                <div
-                  key={index}
-                  className="p-3 bg-gray-50 border border-gray-200 rounded-lg text-gray-700"
-                >
-                  {item}
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className="space-y-2 mb-6">
-              {ranking.map((item, index) => (
-                <div
-                  key={index}
-                  draggable
-                  onDragStart={(e) => handleDragStart(e, index)}
-                  onDragOver={handleDragOver}
-                  onDrop={(e) => handleDrop(e, index)}
-                  className={`flex items-center gap-3 p-3 bg-white border-2 rounded-lg cursor-move transition-all ${
-                    draggedItem === index 
-                      ? 'border-indigo-500 bg-indigo-50 shadow-lg' 
-                      : 'border-gray-200 hover:border-indigo-300 hover:bg-gray-50'
-                  }`}
-                >
-                  <MdDragHandle className="text-gray-400 text-xl" />
-                  <span className="w-8 h-8 rounded-full bg-indigo-100 text-indigo-700 flex items-center justify-center font-bold">
-                    {index + 1}
-                  </span>
-                  <span className="font-medium text-gray-700 flex-1">{item}</span>
-                </div>
-              ))}
-            </div>
-          )}
-          
-          <div className="flex gap-3 mt-6 pt-4 border-t border-gray-200">
-            {ranking.length === 0 ? (
-              <button
-                onClick={startRanking}
-                className="flex-1 py-3 bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 transition-colors font-medium"
-              >
-                Start Ranking
-              </button>
-            ) : (
-              <>
-                <button
-                  onClick={resetRanking}
-                  className="flex-1 py-3 border-2 border-gray-300 text-gray-700 rounded-xl hover:bg-gray-50 transition-colors font-medium"
-                >
-                  Reset
-                </button>
-                <button
-                  onClick={submitRanking}
-                  disabled={rankingSubmitted}
-                  className="flex-1 py-3 bg-green-600 text-white rounded-xl hover:bg-green-700 transition-colors font-medium disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
-                >
-                  {rankingSubmitted ? (
-                    <>Submitted <MdCheckCircle /></>
-                  ) : (
-                    'Submit Ranking'
-                  )}
-                </button>
-              </>
-            )}
-          </div>
-          
-          {ranking.length === 12 && (
-            <p className="text-xs text-gray-500 mt-3 text-center">
-              Drag items to reorder. Click Submit when your group agrees.
+
+          <p className="text-sm text-gray-500 mb-2">Format example (one item per line):</p>
+          <pre className="text-xs bg-gray-100 p-2 rounded mb-4 overflow-x-auto">
+            {`1. ${desertItems[0] || "First item"}\n2. ${desertItems[1] || "Second item"}\n…`}
+          </pre>
+
+          <textarea
+            rows={14}
+            value={rankingText}
+            onChange={(e) => {
+              setRankingText(e.target.value);
+              if (rankingError) setRankingError("");
+            }}
+            placeholder={"1. Item name\n2. Item name\n..."}
+            className="w-full p-3 border border-gray-300 rounded-lg font-mono text-sm"
+          />
+
+          {rankingError && (
+            <p className="text-red-600 text-sm mt-2" role="alert">
+              {rankingError}
             </p>
           )}
+
+          <div className="flex gap-3 mt-6 flex-wrap">
+            <button
+              type="button"
+              onClick={() => {
+                const template = desertItems
+                  .map((item, i) => `${i + 1}. ${item}`)
+                  .join("\n");
+                setRankingText(template);
+                setRankingError("");
+              }}
+              className="px-4 py-2 border-2 border-gray-300 rounded-xl hover:bg-gray-50 transition-colors font-medium text-gray-700"
+            >
+              Generate template
+            </button>
+            <button
+              type="button"
+              onClick={validateAndSubmitRanking}
+              className="flex-1 min-w-[160px] py-3 bg-green-600 text-white rounded-xl hover:bg-green-700 transition-colors font-medium flex items-center justify-center gap-2"
+            >
+              Submit ranking <MdCheckCircle />
+            </button>
+          </div>
+          <p className="text-xs text-gray-500 mt-3">
+            When your group agrees, one submit is enough. The server stores this list as the final ranking.
+          </p>
         </div>
       </div>
     </div>
@@ -783,8 +807,8 @@ export default function ChatRoom() {
               </ol>
             ) : (
               <p className="text-xs text-gray-600">
-                Open the ranking modal when it appears, then drag items into your agreed order. The list here
-                updates as you reorder.
+                When the ranking window opens, enter your agreed order as a numbered list. The draft preview appears
+                here after a successful submit.
               </p>
             )}
           </div>
