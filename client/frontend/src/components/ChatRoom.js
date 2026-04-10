@@ -426,12 +426,17 @@ export default function ChatRoom() {
     // Session ended handler
     socket.on("session_ended", (data) => {
       console.log("📨 Session ended with data:", data);
+      const intended = data?.username;
+      if (intended && intended !== userName) {
+        return;
+      }
       const feedback = data?.feedback || "Session ended. Thank you for participating!";
       navigate("/feedback", {
         state: {
-          feedback: feedback,
+          feedback,
           room_id: data?.room_id,
           studentName: userName,
+          targetUsername: intended || userName,
         },
       });
       setIsLoadingFeedback(false);

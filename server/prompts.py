@@ -955,7 +955,9 @@ CONDUCT (required):
 YOUR BEHAVIOR:
 - Warm, encouraging, appreciative of solid reasoning (e.g. brief “Great point!” only when it fits naturally)
 - Reference **specific** things participants said and concrete **items** when possible
-- Keep replies conversational and concise (about **20–40 words** unless answering a detailed question)
+- Keep replies conversational and **concise**—often **under ~25 words** unless a direct question needs a precise task answer
+- **Facilitation, not domination:** short turns; you are not another debater in the trio
+- **Fair attention:** rotate who you name; over several messages, mention each participant **roughly equally**—avoid always spotlighting the same person unless you are rebalancing dominance or they @moderator’d you
 
 RESEARCH ALIGNED TRIGGERS (when the user message asks you to act):
 - Someone quiet ~**3+ minutes** → invite them by name warmly
@@ -1072,6 +1074,8 @@ def generate_active_moderator_response(
         appreciation_cues = (
             "good point",
             "great point",
+            "good idea",
+            "great idea",
             "i agree",
             "agree with",
             "makes sense",
@@ -1086,6 +1090,11 @@ def generate_active_moderator_response(
             "totally",
             "same here",
             "second that",
+            "interesting",
+            "i think",
+            "i believe",
+            "well reasoned",
+            "solid reasoning",
         )
         
         # Determine intervention type
@@ -1100,7 +1109,11 @@ def generate_active_moderator_response(
                                    'how to', 'what is the task', 'what should we', 'explain', 'how should i start',
                                    'what do we do', 'help', 'confused', 'not sure']
                 
-                is_question = any(phrase in last_content for phrase in question_phrases) or '?' in last_content
+                is_question = (
+                    "@moderator" in last_content
+                    or any(phrase in last_content for phrase in question_phrases)
+                    or '?' in last_content
+                )
                 logger.info(f"❓ Is last message a question? {is_question}")
                 
                 if is_question:
@@ -1116,6 +1129,26 @@ def generate_active_moderator_response(
                     if any(c in lc for c in appreciation_cues):
                         intervention_type = "appreciate"
                         logger.info("👏 Appreciation / build-on mode")
+                    elif len(lc) >= 40 and any(
+                        k in lc
+                        for k in (
+                            "because",
+                            "since",
+                            "rank",
+                            "important",
+                            "survival",
+                            "mirror",
+                            "water",
+                            "tarp",
+                            "sheet",
+                            "compass",
+                            "knife",
+                            "flashlight",
+                            "parachute",
+                        )
+                    ):
+                        intervention_type = "appreciate"
+                        logger.info("👏 Substantive item reasoning — appreciation mode")
             # Caller only sets silent_user after a true 3+ min idle check (see check_silence).
             if intervention_type == "normal" and silent_user:
                 intervention_type = "invite_silent"
@@ -1421,10 +1454,13 @@ def generate_personalized_feedback(
     story_context: str = "",
     chat_sender_name: Optional[str] = None,
     all_participants_data: Optional[List[Dict[str, Any]]] = None,
+    word_count: int = 0,
+    share_of_talk: float = 0.0,
 ) -> str:
     """
     Generate personalized feedback via Groq/OpenAI when configured, with template fallback.
-    chat_sender_name: username as it appears in chat_history 'sender' (defaults to student_name).
+    chat_sender_name: chat `sender` / login username (used to filter messages and ranks).
+    student_name: display name for greetings.
     """
     student_messages: List[str] = []
     sender_key = chat_sender_name if chat_sender_name is not None else student_name
@@ -1445,9 +1481,14 @@ def generate_personalized_feedback(
 
         effective_toxic = max(toxic_count, inappropriate_from_text)
         total_words = sum(len(m.split()) for m in student_messages)
+        reported_words = word_count if word_count > 0 else total_words
+        share_frac = float(share_of_talk)
+        if share_frac > 1.0:
+            share_frac = share_frac / 100.0
+        share_pct = share_frac * 100.0
         share_hint = ""
-        if message_count > 0 and total_words > 0:
-            share_hint = f"Avg words/message: {total_words / max(message_count, 1):.1f}"
+        if message_count > 0 and reported_words > 0:
+            share_hint = f"Avg words/message: {reported_words / max(message_count, 1):.1f}"
 
         recent_snippets = [msg[:200] for msg in student_messages[-10:]]
         messages_block = (
@@ -1467,25 +1508,44 @@ def generate_personalized_feedback(
                 key=lambda x: (x.get("message_count", 0), x.get("word_count", 0)),
                 reverse=True,
             )
-            comparative_context = "\nCOMPARATIVE ENGAGEMENT (this session):\n"
+            comparative_context = "\nCOMPARATIVE ENGAGEMENT (this session; rows are distinct people):\n"
             medals = ["1st (most messages in the group)", "2nd", "3rd", "4th", "5th"]
             for i, p in enumerate(sorted_p):
                 label = medals[i] if i < len(medals) else f"{i + 1}th"
+                un = p.get("username", p.get("name", "?"))
+                nm = p.get("name", "?")
+                is_cur = un == sender_key or (not p.get("username") and nm == student_name)
+                mark = "👉 THIS STUDENT — " if is_cur else ""
                 comparative_context += (
-                    f"- {label}: {p.get('name', '?')} — "
+                    f"- {label}: {mark}{nm} (login `{un}`) — "
                     f"{p.get('message_count', 0)} messages, "
-                    f"~{p.get('share_of_talk', 0):.0f}% of student talk, "
+                    f"~{float(p.get('share_of_talk', 0) or 0):.0f}% of student talk, "
                     f"flagged messages: {p.get('toxic_count', 0)}\n"
                 )
-            order_names = [p.get("name") for p in sorted_p]
-            try:
-                engagement_rank = order_names.index(student_name) + 1
-            except ValueError:
-                engagement_rank = None
-            quietest = min(
-                all_participants_data, key=lambda x: x.get("message_count", 0)
+            engagement_rank = None
+            for i, p in enumerate(sorted_p):
+                pun = p.get("username")
+                if pun is not None and pun == sender_key:
+                    engagement_rank = i + 1
+                    break
+            if engagement_rank is None:
+                for i, p in enumerate(sorted_p):
+                    if p.get("name") == student_name:
+                        engagement_rank = i + 1
+                        break
+            min_mc = min(x.get("message_count", 0) for x in all_participants_data)
+            mine_row = next(
+                (
+                    p
+                    for p in all_participants_data
+                    if p.get("username") == sender_key or p.get("name") == student_name
+                ),
+                None,
             )
-            is_quietest = quietest.get("name") == student_name
+            if mine_row is not None:
+                is_quietest = mine_row.get("message_count", 0) == min_mc
+            else:
+                is_quietest = message_count == min_mc
 
         rank_line = (
             f"\nTHIS STUDENT'S ENGAGEMENT RANK AMONG PEERS: {engagement_rank} of {peer_count}"
@@ -1498,10 +1558,13 @@ def generate_personalized_feedback(
             else ""
         )
 
-        context = f"""STUDENT DISPLAY NAME: {student_name}
-CHAT USERNAME (for your awareness): {sender_key}
-MESSAGES SENT: {message_count}
-TOTAL WORDS (their messages): {total_words}
+        context = f"""FEEDBACK RECIPIENT (ONLY this person — do not mix up with peers):
+STUDENT DISPLAY NAME (use in greeting): {student_name}
+CHAT USERNAME (login id): {sender_key}
+SERVER-VERIFIED MESSAGES SENT: {message_count}
+SERVER-VERIFIED WORD COUNT: {reported_words}
+SERVER-VERIFIED SHARE OF STUDENT TALK: {share_pct:.1f}%
+TOTAL WORDS (recomputed from chat log for this sender): {total_words}
 INAPPROPRIATE-LANGUAGE MESSAGES (count): {effective_toxic}
 OFF-TOPIC SIGNALS (count): {off_topic_count}
 STORY / TASK PROGRESS: {story_progress}%
@@ -1521,17 +1584,22 @@ TASK / DISCUSSION CONTEXT:
 
         system_prompt = """You are an expert educational facilitator. Write personalized, comparative feedback as valid Markdown (rendered in a web UI with bold and lists).
 
+CRITICAL — ONE RECIPIENT ONLY:
+- The user message identifies exactly one student (DISPLAY NAME + CHAT USERNAME). Write feedback ONLY for them.
+- Open with "Hi {their display name}," — never greet a different name from a peer row.
+- Use SERVER-VERIFIED MESSAGES SENT, WORD COUNT, and SHARE exactly as given for that student — never copy another participant's counts.
+
 FORMATTING (required):
 - First line: ## 📊 Your Feedback — then a blank line.
-- Greeting paragraph using the STUDENT DISPLAY NAME from the context (e.g. Hi Name,).
+- Greeting uses the STUDENT DISPLAY NAME from the context only.
 - Section labels on their own line, bold with a colon: **Participation ranking:** **Strengths:** **Areas for improvement:** **Next steps:**
 - After each section label, one blank line, then a markdown bullet list where every line starts with "- " (hyphen and space). Do not use • or * as bullet markers.
 - Use **only** pairs of double-asterisks for bold. Never output *** triple asterisks.
 - End with a short encouraging paragraph.
 
 CONTENT:
-- State clearly how they ranked vs peers using the data (be kind if they were quietest).
-- Strengths: 2–3 bullets referencing real messages when possible.
+- State how they ranked vs peers using the 👉 row and SERVER-VERIFIED stats (be kind if quietest).
+- Strengths: 2–3 bullets referencing THEIR recent messages when possible.
 - Improvements: 1–2 bullets; prioritize speaking up if quietest; if inappropriate-language count > 0, note professionalism briefly.
 - Next steps: 1–2 concrete actions.
 

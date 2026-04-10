@@ -73,10 +73,13 @@ export default function FeedbackPage() {
   useEffect(() => {
     const stateFeedback = location.state?.feedback;
     const fromNavName = (location.state?.studentName || "").trim();
+    const targetUser = (location.state?.targetUsername || "").trim();
 
     if (stateFeedback) {
       setFeedback(stateFeedback);
-      setStudentName(fromNavName || deriveNameFromGreeting(stateFeedback));
+      setStudentName(
+        fromNavName || targetUser || deriveNameFromGreeting(stateFeedback)
+      );
       setLoading(false);
       return;
     }

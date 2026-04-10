@@ -245,6 +245,44 @@ def claim_session_time_warning(room_id: str, kind: str) -> bool:
     return True
 
 
+def _active_moderator_spoken_share(
+    messages: List[Dict[str, Any]], lookback: int = 100
+) -> float:
+    """Share of recent messages (Moderator + students) spoken by Moderator (target < ~0.20)."""
+    if not messages:
+        return 0.0
+    slice_msgs = messages[-lookback:] if len(messages) > lookback else messages
+    mod = sum(1 for m in slice_msgs if m.get("username") == "Moderator")
+    stu = sum(
+        1
+        for m in slice_msgs
+        if m.get("username") not in ("Moderator", "System", None, "")
+    )
+    tot = mod + stu
+    if tot == 0:
+        return 0.0
+    return mod / tot
+
+
+def _room_minutes_elapsed(room: Dict[str, Any], now: Optional[float] = None) -> int:
+    """Whole minutes since room creation."""
+    if now is None:
+        now = time.time()
+    created_at_val = room.get("created_at")
+    if not created_at_val:
+        return 0
+    try:
+        if isinstance(created_at_val, str):
+            cv = created_at_val.replace("Z", "+00:00")
+            created_at_dt = datetime.fromisoformat(cv)
+            return max(0, int((now - created_at_dt.timestamp()) / 60))
+        if isinstance(created_at_val, (int, float)):
+            return max(0, int((now - float(created_at_val)) / 60))
+    except Exception:
+        pass
+    return 0
+
+
 def collect_discussed_canonical_items(
     messages: List[dict], canonical_items: List[str]
 ) -> set:
@@ -767,11 +805,10 @@ def start_active_moderator(room_id: str):
         last_intervention_time = time.time()
         last_dominance_check = time.time()
         last_silence_check = time.time()
-        
-        # Track if we've already invited each participant
-        invited_users = set()
+        # Per-user cooldown for silence invites (re-invite allowed after gap; avoids one-and-done bug)
+        last_silent_invite_at: Dict[str, float] = {}
         # Track last time we sent a dominance message for each user
-        last_dominance_message = {}
+        last_dominance_message: Dict[str, float] = {}
         
         while True:
             try:
@@ -804,7 +841,15 @@ def start_active_moderator(room_id: str):
                 
                 # Get recent messages for analysis
                 messages = get_chat_history(room_id, limit=50)
-                
+                msgs_for_ratio = get_chat_history(room_id, limit=100)
+                mod_share = _active_moderator_spoken_share(msgs_for_ratio)
+                skip_nonessential = mod_share > 0.20
+                if skip_nonessential:
+                    logger.debug(
+                        "Moderator message share %.0f%% — skipping non-essential nudges",
+                        mod_share * 100,
+                    )
+
                 # Get actual participants (excluding Moderator)
                 all_participants = get_participants(room_id)
                 participant_names = [p['username'] for p in all_participants if p['username'] != 'Moderator']
@@ -817,18 +862,20 @@ def start_active_moderator(room_id: str):
                 canonical_items = get_task_items(td_active)
                 n_target = len(canonical_items) or 12
 
-                aux = room_active_moderator_aux.setdefault(
-                    room_id,
-                    {
-                        "last_progress_summary_time": now,
-                        "last_summary_discussed_len": 0,
-                        "statement_attribution": {},
-                        "last_attr_msg_id": None,
-                        "last_turn_balance_msg_id": None,
-                        "last_conflict_deescalation_id": None,
-                        "last_drift_nudge_time": 0.0,
-                    },
-                )
+                _aux_template = {
+                    "last_progress_summary_time": now,
+                    "last_summary_discussed_len": 0,
+                    "statement_attribution": {},
+                    "last_attr_msg_id": None,
+                    "last_turn_balance_msg_id": None,
+                    "last_conflict_deescalation_id": None,
+                    "last_drift_nudge_time": 0.0,
+                    "last_at_mod_reply_for_msg_id": None,
+                    "last_appreciation_sent": 0.0,
+                }
+                aux = room_active_moderator_aux.setdefault(room_id, dict(_aux_template))
+                for _k, _v in _aux_template.items():
+                    aux.setdefault(_k, _v)
 
                 if messages:
                     lm = messages[-1]
@@ -846,7 +893,8 @@ def start_active_moderator(room_id: str):
                 streak_user, streak = trailing_student_streak(messages)
                 last_mid = str(messages[-1].get("id", "")) if messages else ""
                 if (
-                    streak >= 3
+                    not skip_nonessential
+                    and streak >= 3
                     and streak_user
                     and last_mid
                     and last_mid != str(aux.get("last_turn_balance_msg_id") or "")
@@ -908,7 +956,8 @@ def start_active_moderator(room_id: str):
 
                 # RQ4: Refocus when chat drifts off ranking / items (at most ~every 2 min)
                 if (
-                    time_elapsed >= 4
+                    not skip_nonessential
+                    and time_elapsed >= 4
                     and discussion_appears_off_task(messages, canonical_items)
                     and now - float(aux.get("last_drift_nudge_time") or 0) > 120
                     and now - last_intervention_time > 55
@@ -939,7 +988,9 @@ def start_active_moderator(room_id: str):
                     # 2. We haven't intervened in the last 60 seconds (cooldown)
                     # 3. The dominant user is actually in the room
                     # 4. We haven't sent a dominance message to this user in the last 2 minutes
-                    if (dominant_user and 
+                    if (
+                        not skip_nonessential
+                        and dominant_user and 
                         dominant_user in participant_names and 
                         (now - last_intervention_time > 60) and
                         (dominant_user not in last_dominance_message or now - last_dominance_message.get(dominant_user, 0) > 120)):
@@ -988,15 +1039,50 @@ def start_active_moderator(room_id: str):
                 # RULE 2: Check for silence (3 minutes) - invite quieter members
                 if now - last_silence_check > 30:  # Check every 30 seconds
                     silent_user = check_silence(room_id)
-                    
+                    if (
+                        not silent_user
+                        and len(messages) >= 8
+                        and len(participant_names) >= 3
+                    ):
+                        counts = {p: 0 for p in participant_names}
+                        for m in messages:
+                            u = m.get("username")
+                            if u in counts:
+                                counts[u] += 1
+                        if len([u for u in participant_names if counts[u] > 0]) >= 2:
+                            lag = min(participant_names, key=lambda u: counts[u])
+                            hi, lo = max(counts.values()), counts[lag]
+                            if hi - lo >= 3:
+                                last_ts: Optional[float] = None
+                                for m in reversed(messages):
+                                    if m.get("username") == lag:
+                                        try:
+                                            last_ts = datetime.fromisoformat(
+                                                m["created_at"].replace("Z", "+00:00")
+                                            ).timestamp()
+                                        except Exception:
+                                            last_ts = now
+                                        break
+                                if last_ts is not None and (now - last_ts) >= 120:
+                                    if (now - last_silent_invite_at.get(lag, 0)) > 180:
+                                        silent_user = lag
+                                        logger.info(
+                                            "🤫 Lagging participant (inclusion nudge): %s (%s vs %s msgs)",
+                                            lag,
+                                            lo,
+                                            hi,
+                                        )
+
                     # Only trigger if:
                     # 1. A silent user is detected
                     # 2. We haven't intervened in the last 60 seconds (cooldown)
                     # 3. The silent user hasn't been invited recently
-                    if (silent_user and 
-                        silent_user in participant_names and 
-                        (now - last_intervention_time > 60) and
-                        silent_user not in invited_users):
+                    if (
+                        silent_user
+                        and silent_user in participant_names
+                        and (now - last_intervention_time > 60)
+                        and (now - last_silent_invite_at.get(silent_user, 0) > 180)
+                    ):
                         
                         logger.info(f"🤫 Silence detected: {silent_user}")
                         
@@ -1023,7 +1109,7 @@ def start_active_moderator(room_id: str):
                         )
                         
                         log_moderator_intervention(room_id, "invite_silent", silent_user)
-                        invited_users.add(silent_user)
+                        last_silent_invite_at[silent_user] = now
                         last_intervention_time = now
                         
                         logger.info(f"✅ Sent invitation to {silent_user}")
@@ -1077,78 +1163,146 @@ def start_active_moderator(room_id: str):
                 if messages and len(messages) > 0:
                     last_msg = messages[-1]
                     if last_msg.get('username') != 'Moderator':
-                        msg_content = last_msg.get('message', '').lower()
-                        
-                        # Check if it's a question (contains ? or question words)
-                        is_question = False
-                        if '?' in msg_content:
-                            is_question = True
-                        else:
-                            question_words = ['what', 'how', 'why', 'when', 'where', 'which', 'who', 
-                                             'explain', 'help', 'confused', 'not sure', 'do we', 'should we',
-                                             'can you', 'could you', 'would you', 'tell me']
-                            for word in question_words:
-                                if word in msg_content:
+                        lm_id_q = str(last_msg.get("id", ""))
+                        handled_at_mod = lm_id_q and lm_id_q == str(
+                            aux.get("last_at_mod_reply_for_msg_id") or ""
+                        )
+                        if not handled_at_mod:
+                            msg_content = last_msg.get('message', '').lower()
+
+                            # Check if it's a question (contains ? or question words)
+                            is_question = False
+                            if '?' in msg_content:
+                                is_question = True
+                            else:
+                                question_words = ['what', 'how', 'why', 'when', 'where', 'which', 'who',
+                                                 'explain', 'help', 'confused', 'not sure', 'do we', 'should we',
+                                                 'can you', 'could you', 'would you', 'tell me', 'guide']
+                                for word in question_words:
+                                    if word in msg_content:
+                                        is_question = True
+                                        break
+
+                            # Also check for question phrases
+                            question_phrases = ['what to do', 'what next', 'how to', 'what is', 'what are',
+                                               'what should', 'how do', 'can you help', 'need help']
+                            for phrase in question_phrases:
+                                if phrase in msg_content:
                                     is_question = True
                                     break
-                        
-                        # Also check for question phrases
-                        question_phrases = ['what to do', 'what next', 'how to', 'what is', 'what are',
-                                           'what should', 'how do', 'can you help', 'need help']
-                        for phrase in question_phrases:
-                            if phrase in msg_content:
-                                is_question = True
-                                break
-                        
-                        if is_question and (now - last_intervention_time > 30):
-                            logger.info(f"❓ Question detected from {last_msg.get('username')}: {msg_content[:100]}...")
-                            
-                            # Generate response using LLM
-                            response = generate_active_moderator_response(
-                                participants=participant_names,
-                                chat_history=[{"sender": m['username'], "message": m['message']} for m in messages],
-                                task_context="Desert survival ranking",
-                                time_elapsed=time_elapsed,
-                                last_intervention_time=int(now - last_intervention_time),
-                                dominance_detected=None,
-                                silent_user=None
+
+                            if is_question and (
+                                "@moderator" in msg_content or (now - last_intervention_time > 30)
+                            ):
+                                logger.info(f"❓ Question detected from {last_msg.get('username')}: {msg_content[:100]}...")
+
+                                response = generate_active_moderator_response(
+                                    participants=participant_names,
+                                    chat_history=[{"sender": m['username'], "message": m['message']} for m in messages],
+                                    task_context="Desert survival ranking",
+                                    time_elapsed=time_elapsed,
+                                    last_intervention_time=int(now - last_intervention_time),
+                                    dominance_detected=None,
+                                    silent_user=None
+                                )
+
+                                if response and len(response.strip()) > 10:
+                                    add_message(room_id, "Moderator", response.strip(), "moderator")
+                                    socketio.emit(
+                                        "receive_message",
+                                        chat_socket_payload("Moderator", response.strip()),
+                                        room=room_id,
+                                    )
+
+                                    log_moderator_intervention(room_id, "answered_question", last_msg.get('username'))
+                                    last_intervention_time = now
+                                    logger.info(f"✅ Answered question from {last_msg.get('username')}: {response[:100]}...")
+                                else:
+                                    fallback = "Your task is to rank the 12 desert survival items from most important (1) to least important (12). Discuss with your group and agree on a final ranking."
+
+                                    if 'time' in msg_content or 'minute' in msg_content:
+                                        fallback = f"You have about {time_remaining} minutes remaining to complete the ranking task."
+                                    elif 'item' in msg_content or 'rank' in msg_content:
+                                        fallback = "You need to rank the 12 items from most important (1) to least important (12) for desert survival. Discuss with your group and reach consensus."
+
+                                    add_message(room_id, "Moderator", fallback, "moderator")
+                                    socketio.emit(
+                                        "receive_message",
+                                        chat_socket_payload("Moderator", fallback),
+                                        room=room_id,
+                                    )
+
+                                    log_moderator_intervention(room_id, "answered_question_fallback", last_msg.get('username'))
+                                    last_intervention_time = now
+                                    logger.info(f"✅ Sent fallback answer to {last_msg.get('username')}")
+
+                # RULE 4.25: Brief appreciation for substantive item-focused reasoning (low frequency)
+                _app_sub = (
+                    "because",
+                    "since",
+                    "rank",
+                    "important",
+                    "survival",
+                    "mirror",
+                    "water",
+                    "tarp",
+                    "sheet",
+                    "compass",
+                    "knife",
+                    "flashlight",
+                    "parachute",
+                    "matches",
+                    "coat",
+                )
+                if (
+                    not skip_nonessential
+                    and messages
+                    and messages[-1].get("username") not in ("Moderator", "System", None, "")
+                    and now - float(aux.get("last_appreciation_sent") or 0) > 95
+                    and now - last_intervention_time > 55
+                ):
+                    _lm = messages[-1]
+                    _lc = (_lm.get("message") or "").lower()
+                    if len(_lc) >= 38 and any(s in _lc for s in _app_sub):
+                        _resp_ap = generate_active_moderator_response(
+                            participants=participant_names,
+                            chat_history=[
+                                {"sender": m["username"], "message": m["message"]}
+                                for m in messages
+                            ],
+                            task_context="Desert survival ranking",
+                            time_elapsed=time_elapsed,
+                            last_intervention_time=int(now - last_intervention_time),
+                            dominance_detected=None,
+                            silent_user=None,
+                        )
+                        if _resp_ap and len(_resp_ap.strip()) > 12:
+                            add_message(
+                                room_id, "Moderator", _resp_ap.strip(), "moderator"
                             )
-                            
-                            # Only send if we got a valid response (not fallback)
-                            if response and len(response) > 10 and "Thanks for sharing" not in response:
-                                add_message(room_id, "Moderator", response, "moderator")
-                                socketio.emit(
-                                    "receive_message",
-                                    chat_socket_payload("Moderator", response),
-                                    room=room_id,
-                                )
-                                
-                                log_moderator_intervention(room_id, "answered_question", last_msg.get('username'))
-                                last_intervention_time = now
-                                logger.info(f"✅ Answered question from {last_msg.get('username')}: {response[:100]}...")
-                            else:
-                                # Fallback answer based on question type
-                                fallback = "Your task is to rank the 12 desert survival items from most important (1) to least important (12). Discuss with your group and agree on a final ranking. You have 15 minutes total."
-                                
-                                # Customize fallback based on question content
-                                if 'time' in msg_content or 'minute' in msg_content:
-                                    fallback = f"You have about {time_remaining} minutes remaining to complete the ranking task."
-                                elif 'item' in msg_content or 'rank' in msg_content:
-                                    fallback = "You need to rank the 12 items from most important (1) to least important (12) for desert survival. Discuss with your group and reach consensus."
-                                
-                                add_message(room_id, "Moderator", fallback, "moderator")
-                                socketio.emit(
-                                    "receive_message",
-                                    chat_socket_payload("Moderator", fallback),
-                                    room=room_id,
-                                )
-                                
-                                log_moderator_intervention(room_id, "answered_question_fallback", last_msg.get('username'))
-                                last_intervention_time = now
-                                logger.info(f"✅ Sent fallback answer to {last_msg.get('username')}")
-                
+                            socketio.emit(
+                                "receive_message",
+                                chat_socket_payload("Moderator", _resp_ap.strip()),
+                                room=room_id,
+                            )
+                            log_moderator_intervention(
+                                room_id,
+                                "appreciation",
+                                _lm.get("username"),
+                            )
+                            aux["last_appreciation_sent"] = now
+                            last_intervention_time = now
+                            logger.info(
+                                "✅ Appreciation nudge after message from %s",
+                                _lm.get("username"),
+                            )
+
                 # RULE 4.5: Occasional expert survival perspective when a specific item is discussed
-                if messages and len(messages) > 0:
+                if (
+                    not skip_nonessential
+                    and messages
+                    and len(messages) > 0
+                ):
                     tip_msg = messages[-1]
                     if tip_msg.get("username") != "Moderator":
                         raw_tip = tip_msg.get("message", "")
@@ -1203,8 +1357,10 @@ def start_active_moderator(room_id: str):
                 discussed = collect_discussed_canonical_items(messages, canonical_items)
                 time_since_recap = now - aux["last_progress_summary_time"]
                 new_since_recap = len(discussed) - aux["last_summary_discussed_len"]
-                if (time_since_recap >= 300 or new_since_recap >= 3) and (
-                    now - last_intervention_time > 60
+                if (
+                    not skip_nonessential
+                    and (time_since_recap >= 300 or new_since_recap >= 3)
+                    and (now - last_intervention_time > 60)
                 ):
                     mins = max(1, int(time_since_recap // 60))
                     summary_lines = [
@@ -1936,6 +2092,45 @@ def send_message_handler(data):
             room=room_id,
         )
 
+        if room.get("mode") == "active" and "@moderator" in msg.lower():
+            try:
+                te = _room_minutes_elapsed(room)
+                participants = get_participants(room_id)
+                participant_names = [
+                    p["username"]
+                    for p in participants
+                    if p.get("username") not in ("Moderator", "System", None, "")
+                ]
+                hist_msgs = get_chat_history(room_id, limit=45)
+                chat_history = [
+                    {"sender": m["username"], "message": m.get("message", "")}
+                    for m in hist_msgs
+                ]
+                response = generate_active_moderator_response(
+                    participants=participant_names,
+                    chat_history=chat_history,
+                    task_context="Desert survival ranking",
+                    time_elapsed=te,
+                    last_intervention_time=0,
+                    dominance_detected=None,
+                    silent_user=None,
+                )
+                rsp = (response or "").strip()
+                if len(rsp) > 8:
+                    add_message(room_id, "Moderator", rsp, "moderator")
+                    socketio.emit(
+                        "receive_message",
+                        chat_socket_payload("Moderator", rsp),
+                        room=room_id,
+                    )
+                    log_moderator_intervention(room_id, "active_at_mention", sender)
+                    _aux_inline = room_active_moderator_aux.setdefault(room_id, {})
+                    _aux_inline["last_at_mod_reply_for_msg_id"] = str(
+                        saved_chat.get("id", "")
+                    )
+            except Exception as atmod_ex:
+                logger.error("Active @moderator inline reply failed: %s", atmod_ex)
+
         try:
             td = get_pinned_or_resolve_task_data(room_id)
             items = get_task_items(td)
@@ -2178,12 +2373,18 @@ def handle_end_session(data):
             all_participants_data.append(
                 {
                     "name": participant.get("display_name", un),
+                    "username": un,
                     "message_count": message_counts.get(un, 0),
                     "word_count": word_counts.get(un, 0),
                     "share_of_talk": speaking_shares.get(un, 0) * 100,
                     "toxic_count": flagged_n,
                 }
             )
+
+        all_participants_data.sort(
+            key=lambda x: (x.get("message_count", 0), x.get("word_count", 0)),
+            reverse=True,
+        )
 
         feedbacks = {}
 
@@ -2229,6 +2430,8 @@ def handle_end_session(data):
                     feedback = generate_personalized_feedback(
                         student_name=display_name,
                         message_count=message_count,
+                        word_count=word_count,
+                        share_of_talk=share_of_talk,
                         response_times=[],
                         story_progress=progress_percent,
                         hint_responses=0,
