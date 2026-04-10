@@ -231,6 +231,7 @@ room_last_expert_tip: Dict[str, float] = {}
 room_expert_tip_message_key: Dict[str, str] = {}
 room_active_moderator_aux: Dict[str, Dict[str, Any]] = {}
 last_item_clarification_at: Dict[str, float] = {}
+room_ranking_completion_hint_at: Dict[str, float] = {}
 # One 5-min and one 1-min warning per room across timer + active + passive threads
 room_time_warning_5min_claimed: Dict[str, bool] = {}
 room_time_warning_1min_claimed: Dict[str, bool] = {}
@@ -248,7 +249,7 @@ def claim_session_time_warning(room_id: str, kind: str) -> bool:
 def _active_moderator_student_msg_ratio(
     messages: List[Dict[str, Any]], lookback: int = 100
 ) -> float:
-    """Moderator_msg_count / max(student_msg_count, 1). Target ≤ 0.20 (RQ1)."""
+    """Moderator_msg_count / max(student_msg_count, 1). Target ≤ 0.15 (RQ1)."""
     if not messages:
         return 0.0
     slice_msgs = messages[-lookback:] if len(messages) > lookback else messages
@@ -500,14 +501,36 @@ GROQ_TEMPERATURE = get_setting_value("GROQ_TEMPERATURE", 0.7)
 GROQ_MAX_TOKENS = get_setting_value("GROQ_MAX_TOKENS", 2000)
 
 # Research settings - FROM YOUR EXPERIMENT DESIGN
-SILENCE_THRESHOLD_SECONDS = 120  # 2 minutes — earlier inclusion (RQ1/RQ3)
-SILENCE_FOLLOWUP_SECONDS = 180  # second gentle ping if still quiet after first invite
+SILENCE_THRESHOLD_SECONDS = 90  # first silence invite (~1.5 min idle)
+SILENCE_FOLLOWUP_SECONDS = 150  # follow-up if still quiet after first invite (~2.5 min idle)
 SILENCE_REINVITE_GAP_SECONDS = 90  # min gap between silence nudges to same person
 DOMINANCE_THRESHOLD = 0.5  # 50% of recent messages - if one person contributes >50%, balance
 TIME_WARNING_MINUTES = 5  # Warn when 5 minutes remaining
 
+# Participant chat hints → open ranking UI (RQ4); substring match on lowercased message
+RANKING_COMPLETION_HINT_PHRASES: tuple[str, ...] = (
+    "i m done",
+    "i'm done",
+    "im done",
+    "i am done",
+    "i have ranked",
+    "i ranked all",
+    "done ranking",
+    "finished ranking",
+    "finished the ranking",
+    "my ranking is",
+    "we are done",
+    "we're done",
+    "were done ranking",
+)
+
 logger.info(f"📝 Config: LLM Provider={LLM_PROVIDER}, Model={GROQ_MODEL}")
-logger.info(f"📝 Research Settings: Silence={SILENCE_THRESHOLD_SECONDS}s, Dominance Threshold={DOMINANCE_THRESHOLD*100}%")
+logger.info(
+    "📝 Research Settings: Silence=%ss followup=%ss, Dominance=%s%%",
+    SILENCE_THRESHOLD_SECONDS,
+    SILENCE_FOLLOWUP_SECONDS,
+    int(DOMINANCE_THRESHOLD * 100),
+)
 logger.info(f"📝 Frontend URL: {FRONTEND_URL}")
 
 # ============================================================
@@ -666,7 +689,7 @@ def get_room_task_data(room_id: str) -> Optional[Dict[str, Any]]:
 # RESEARCH TIMER - 15 Minute Session Timer
 # ============================================================
 def start_research_timer(room_id: str):
-    """15-minute session: 6→2→0 min prompts, force ranking modal, auto end + feedback (RQ4)."""
+    """15-minute session: 6m / 2m / 1m remaining warnings + force_ranking_modal, then auto end (RQ4)."""
 
     def timer_loop():
         # t=9m elapsed → 6 minutes remaining
@@ -704,10 +727,32 @@ def start_research_timer(room_id: str):
                     room=room_id,
                 )
             except Exception as e:
-                logger.warning("force_ranking_modal emit failed: %s", e)
+                logger.warning("force_ranking_modal (2m) failed: %s", e)
+
+        # t=14m → last minute
+        time.sleep(1 * 60)
+        room = get_room(room_id)
+        if room and room.get("status") == "active":
+            last_push = (
+                "⏰ **LAST MINUTE!** Submit your **final ranking of all 12 items** now."
+            )
+            add_message(room_id, "Moderator", last_push, "system")
+            socketio.emit(
+                "receive_message",
+                chat_socket_payload("Moderator", last_push),
+                room=room_id,
+            )
+            try:
+                socketio.emit(
+                    "force_ranking_modal",
+                    {"room_id": room_id},
+                    room=room_id,
+                )
+            except Exception as e:
+                logger.warning("force_ranking_modal (1m) failed: %s", e)
 
         # t=15m → time's up
-        time.sleep(2 * 60)
+        time.sleep(1 * 60)
         room = get_room(room_id)
         if room and room.get("status") == "active":
             final_msg = (
@@ -728,7 +773,9 @@ def start_research_timer(room_id: str):
     thread = threading.Thread(target=timer_loop, daemon=True)
     thread.start()
     research_timers[room_id] = thread
-    logger.info(f"⏰ Research timer started for room {room_id} (15 minutes, RQ4 milestones)")
+    logger.info(
+        f"⏰ Research timer started for room {room_id} (milestones: 6m/2m/1m left, RQ4)"
+    )
 
 # ============================================================
 # Helper: Start Task
@@ -867,7 +914,7 @@ def start_active_moderator(room_id: str):
                 messages = get_chat_history(room_id, limit=50)
                 msgs_for_ratio = get_chat_history(room_id, limit=100)
                 mod_ratio = _active_moderator_student_msg_ratio(msgs_for_ratio)
-                skip_nonessential = mod_ratio > 0.20
+                skip_nonessential = mod_ratio > 0.15
                 if skip_nonessential:
                     logger.debug(
                         "Moderator/student msg ratio %.2f — skipping non-essential nudges",
@@ -1121,7 +1168,9 @@ def start_active_moderator(room_id: str):
                                             except Exception:
                                                 last_ts = now
                                             break
-                                    if last_ts is not None and (now - last_ts) >= 120:
+                                    if last_ts is not None and (
+                                        now - last_ts
+                                    ) >= SILENCE_THRESHOLD_SECONDS:
                                         if (
                                             now - last_silent_invite_at.get(lag, 0)
                                         ) > SILENCE_REINVITE_GAP_SECONDS:
@@ -1696,7 +1745,7 @@ def _room_created_timestamp(room: Optional[Dict]) -> float:
 
 def check_silence(room_id: str) -> Optional[str]:
     """
-    Triad rule: invite only if a participant has been quiet for SILENCE_THRESHOLD_SECONDS.
+    Triad rule: invite only if a participant has been quiet for SILENCE_THRESHOLD_SECONDS (~1.5 min).
     Per-user idle = time since their last student message; members who never spoke use
     time since room creation until their first message exists.
     """
@@ -1753,7 +1802,7 @@ def check_silent_followup_candidate(
     now: float,
 ) -> Optional[str]:
     """
-    Second nudge: person was invited once, still idle ≥ SILENCE_FOLLOWUP_SECONDS,
+    Second nudge: invited once, still idle ≥ SILENCE_FOLLOWUP_SECONDS (~2.5 min),
     ≥75s since last silence message to them, follow-up not yet sent.
     """
     if len(participant_names) < 3:
@@ -2120,6 +2169,19 @@ def send_message_handler(data):
                 f"⚠️ Inappropriate language from {sender}: {bad_words} (severity: {severity})"
             )
             if severity == "HIGH":
+                high_severity_response = (
+                    "⚠️ Please keep our discussion respectful and professional. "
+                    "Focus on the ideas, not personal attacks. Let's continue with the ranking task."
+                )
+                add_message(room_id, "Moderator", high_severity_response, "moderator")
+                socketio.emit(
+                    "receive_message",
+                    chat_socket_payload("Moderator", high_severity_response),
+                    room=room_id,
+                )
+                log_moderator_intervention(room_id, "high_severity_warning", sender)
+
+            if severity == "HIGH":
                 warning_msg = (
                     "Your message contained inappropriate language. "
                     "Please keep our discussion professional, respectful, and focused on the "
@@ -2183,19 +2245,6 @@ def send_message_handler(data):
             )
             logger.info(f"✅ Flagged message from {sender} broadcast (severity={severity})")
 
-            if severity == "HIGH":
-                resolution = enforce_response_length(
-                    "Let's reset tone and refocus on collaboration—which **item** in your **12-item list** "
-                    "should the group settle next, and why?",
-                    45,
-                )
-                add_message(room_id, "Moderator", resolution, "moderator")
-                socketio.emit(
-                    "receive_message",
-                    chat_socket_payload("Moderator", resolution),
-                    room=room_id,
-                )
-                log_moderator_intervention(room_id, "conflict_resolution", sender)
             return
 
         saved_chat = add_message(
@@ -2215,6 +2264,40 @@ def send_message_handler(data):
             ),
             room=room_id,
         )
+
+        msg_lower = msg.lower()
+        if any(p in msg_lower for p in RANKING_COMPLETION_HINT_PHRASES):
+            now_hint = time.time()
+            if now_hint - room_ranking_completion_hint_at.get(room_id, 0) >= 75:
+                room_ranking_completion_hint_at[room_id] = now_hint
+                reminder = (
+                    f"Thanks, {sender}. When your group is ready, please open the ranking window and "
+                    "click **Submit ranking** so your **final order of all 12 items** is saved."
+                )
+                add_message(room_id, "Moderator", reminder, "moderator")
+                socketio.emit(
+                    "receive_message",
+                    chat_socket_payload("Moderator", reminder),
+                    room=room_id,
+                )
+                try:
+                    socketio.emit(
+                        "force_ranking_modal",
+                        {"room_id": room_id},
+                        room=room_id,
+                    )
+                except Exception as r4e:
+                    logger.warning("force_ranking_modal (completion hint): %s", r4e)
+                log_moderator_intervention(room_id, "ranking_completion_hint", sender)
+            else:
+                try:
+                    socketio.emit(
+                        "force_ranking_modal",
+                        {"room_id": room_id},
+                        room=room_id,
+                    )
+                except Exception as r4e:
+                    logger.warning("force_ranking_modal (completion hint, cooldown): %s", r4e)
 
         if room.get("mode") == "active" and "@moderator" in msg.lower():
             try:

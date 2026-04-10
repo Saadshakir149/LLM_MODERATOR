@@ -91,6 +91,18 @@ function parseRankingFromText(text) {
 /**
  * Map free-text lines to canonical server item strings (exact, then loose single match).
  */
+const CLIENT_RANKING_COMPLETION_PHRASES = [
+  "i m done",
+  "i'm done",
+  "im done",
+  "i am done",
+  "i have ranked",
+  "i ranked all",
+  "done ranking",
+  "finished ranking",
+  "my ranking is",
+];
+
 function resolveRankingToCanonical(parsed, canonicalList) {
   const resolved = [];
   const used = new Set();
@@ -332,6 +344,16 @@ export default function ChatRoom() {
     setTimeWarning(true);
     setShowRankingModal(true);
   }, [roomId]);
+
+  useEffect(() => {
+    const last = messages[messages.length - 1];
+    if (!last || last.sender === "Moderator" || last.sender === "System") return;
+    const text = String(last.message || "").toLowerCase();
+    if (!CLIENT_RANKING_COMPLETION_PHRASES.some((p) => text.includes(p))) return;
+    if (rankingSubmitted) return;
+    setTimeWarning(true);
+    setShowRankingModal(true);
+  }, [messages, rankingSubmitted]);
 
   // ============================================================
   // ⚡ SOCKET CONNECTION & MESSAGES

@@ -923,11 +923,29 @@ _MEDIUM_SEVERITY_FRAGMENTS: frozenset[str] = frozenset(
 )
 
 
+# Directed / interpersonal insults that must surface as HIGH (public moderator row + RQ2).
+_INTERPERSONAL_ATTACK_HIGH_PHRASES: frozenset[str] = frozenset(
+    {
+        "shut the fuck up",
+        "shut up",
+        "shutup",
+        "stfu",
+        "stfuu",
+        "gtfo",
+        "fuck off",
+        "f u",
+    }
+)
+
+
 def get_language_severity(bad_words: List[str]) -> str:
     """HIGH / MEDIUM / LOW from matched terms (worst wins)."""
     if not bad_words:
         return "LOW"
     blob = " ".join(bad_words).lower()
+    for p in sorted(_INTERPERSONAL_ATTACK_HIGH_PHRASES, key=len, reverse=True):
+        if p in blob:
+            return "HIGH"
     for w in sorted(_HIGH_SEVERITY_FRAGMENTS, key=len, reverse=True):
         if w in blob:
             return "HIGH"
@@ -961,7 +979,7 @@ YOUR BEHAVIOR:
 - **Phrase variety:** do not repeat the same reassurance or filler (e.g. “don’t worry,” “no problem”) across consecutive messages—use different wording
 
 RESEARCH ALIGNED TRIGGERS (when the user message asks you to act):
-- Someone quiet ~**2+ minutes** → invite them by name warmly (a second, gentler ping may follow if they stay quiet)
+- Someone quiet **~90s / ~1.5+ minutes** → invite them by name warmly (a second ping may follow if they stay quiet)
 - One person >**~50%** of recent talk → acknowledge them, then bring in others by name
 - Questions about the task / time → answer clearly (full **12-item** ranking, 1–12)
 - Time pressure → remind them the output is a **complete** ranked list of **all 12** items
